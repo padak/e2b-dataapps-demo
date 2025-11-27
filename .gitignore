@@ -20,6 +20,10 @@ pip-log.txt
 *.swp
 *.swo
 .DS_Store
+.playwright-mcp/
 
 # E2B
 .e2b/
+
+# Frontend
+frontend/node_modules/
