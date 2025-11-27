@@ -1212,30 +1212,37 @@ async with ClaudeSDKClient() as client:
 
 ## Checklist
 
-### Fáze 1: Backend ✅ Ready to implement
-- [ ] Project setup (FastAPI, requirements.txt)
-- [ ] SandboxManager class
-- [ ] MCP Tools (write_file, read_file, run_command, get_url)
-- [ ] AppBuilderAgent class
-- [ ] WebSocket handler
-- [ ] FastAPI main app
-- [ ] Basic tests
+### Fáze 1: Backend ✅ DONE
+- [x] Project setup (FastAPI, requirements.txt)
+- [x] SandboxManager class
+- [x] MCP Tools (write_file, read_file, run_command, get_url, install_packages, list_files)
+- [x] AppBuilderAgent class with system prompt
+- [x] WebSocket handler (ConnectionManager)
+- [x] FastAPI main app (/ws/chat, /api/session, /health)
+- [ ] Basic tests (skipped for MVP)
 
-### Fáze 2: E2B Template
-- [ ] e2b.toml configuration
-- [ ] package.json with all deps
-- [ ] Base Next.js setup
-- [ ] shadcn/ui components
-- [ ] Template registration
+### Fáze 2: E2B Template ✅ DONE
+- [x] e2b.toml configuration
+- [x] Dockerfile for sandbox
+- [x] package.json with all deps (Next.js, shadcn, recharts, etc.)
+- [x] Base Next.js setup (app router, tailwind, typescript)
+- [x] shadcn/ui Button component
+- [ ] Template registration with E2B (requires `e2b template build`)
 
-### Fáze 3: Frontend
-- [ ] Next.js project setup
-- [ ] WebSocket client
-- [ ] Zustand store
-- [ ] ChatPanel component
-- [ ] PreviewPanel component
-- [ ] File tree component
-- [ ] Code view (Monaco)
+### Fáze 3: Frontend ✅ DONE
+- [x] WebSocket client (lib/websocket.ts)
+- [x] Zustand store (lib/store.ts)
+- [x] Chat types (types/chat.ts)
+- [x] ChatPanel component
+- [x] ChatMessage component
+- [x] ChatInput component
+- [x] MessageList component
+- [x] ToolUseIndicator component
+- [x] PreviewPanel component
+- [x] PreviewIframe component
+- [x] CodeView component
+- [x] ConsoleOutput component
+- [x] FileTree component
 
 ### Fáze 4: Integration
 - [ ] End-to-end flow

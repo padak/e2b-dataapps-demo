@@ -1,0 +1,3 @@
+template_id = "nextjs-data-app"
+dockerfile = "Dockerfile"
+start_cmd = "npm run dev -- -p 3000"

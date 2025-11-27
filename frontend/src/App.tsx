@@ -14,7 +14,7 @@ import {
   Minimize2,
   PanelLeftClose,
   PanelLeft,
-  ChevronDown,
+  
 } from 'lucide-react';
 
 import CodeEditor from './components/CodeEditor';

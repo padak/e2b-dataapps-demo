@@ -1,3 +1,18 @@
+// Re-export chat types
+export type {
+  Message,
+  ToolUse,
+  ToolUseEvent,
+  TextDeltaEvent,
+  MessageCompleteEvent,
+  PreviewUpdateEvent,
+  ErrorEvent,
+  StatusEvent,
+  WebSocketEvent,
+  ChatState,
+  ChatMessage,
+} from './chat';
+
 export interface LogEntry {
   id: string;
   timestamp: number;
