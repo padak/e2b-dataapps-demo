@@ -1244,13 +1244,21 @@ async with ClaudeSDKClient() as client:
 - [x] ConsoleOutput component
 - [x] FileTree component
 
-### Fáze 4: Integration
-- [ ] End-to-end flow
-- [ ] Error handling
-- [ ] Loading states
-- [ ] File sync
-- [ ] Console output
-- [ ] Polish & UX
+### Fáze 4: Integration ⏳ TODO
+- [ ] Create new App Builder page (frontend/src/AppBuilder.tsx)
+  - Left panel: ChatPanel connected to WebSocket
+  - Right panel: PreviewPanel showing E2B sandbox
+- [ ] Wire up WebSocket connection in AppBuilder
+  - Connect to backend ws://localhost:8000/ws/chat/{sessionId}
+  - Handle all event types (text, tool_use, done, error)
+- [ ] Update frontend routing (add /builder route or replace main app)
+- [ ] Test end-to-end flow:
+  1. Start backend: `cd backend && uvicorn app.main:app --reload`
+  2. Start frontend: `cd frontend && npm run dev`
+  3. Open http://localhost:5173
+  4. Send message → Claude creates files → E2B sandbox runs → Preview shows app
+- [ ] Build E2B template: `cd sandbox-template && e2b template build`
+- [ ] Polish & error handling
 
 ---
 
