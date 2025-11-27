@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 AppBuilderAgent - Claude Agent SDK wrapper for Next.js/React/TypeScript app builder.
-Provides agentic workflow for building data applications in E2B sandboxes.
+Provides agentic workflow for building data applications in sandboxes.
 """
 
-import asyncio
+import logging
+import os
 from typing import AsyncIterator, Callable, Optional
 
 from claude_agent_sdk import (
@@ -16,11 +17,21 @@ from claude_agent_sdk import (
     ToolResultBlock,
 )
 
-from .sandbox_manager import SandboxManager
+from .sandbox_factory import create_sandbox_manager
 from .tools.sandbox_tools import create_sandbox_tools_server
 
+# Default model if not specified in environment
+DEFAULT_MODEL = "claude-sonnet-4-5"
 
-SYSTEM_PROMPT = """You are an expert Next.js/React/TypeScript developer building data-driven web applications.
+
+def get_sandbox_mode() -> str:
+    """Get the current sandbox mode from environment."""
+    return os.getenv("SANDBOX_MODE", "local").lower()
+
+
+SYSTEM_PROMPT_BASE = """You are an expert Next.js/React/TypeScript developer building data-driven web applications in an isolated sandbox environment.
+
+CRITICAL: You are working in a sandbox environment. ALL commands and file operations run INSIDE this sandbox. NEVER tell the user to run commands themselves - YOU must run everything in the sandbox using your tools.
 
 Your role is to help users build modern, production-quality web applications using:
 - **Next.js 14+** with App Router
@@ -31,7 +42,7 @@ Your role is to help users build modern, production-quality web applications usi
 
 ## Your Capabilities
 
-You have access to E2B sandbox tools that allow you to:
+You have access to sandbox tools that allow you to:
 1. **Create files** - Write code files (components, pages, utilities, configs)
 2. **Execute commands** - Run npm/yarn commands, build, test, install packages
 3. **Read files** - Inspect existing code and configurations
@@ -39,6 +50,16 @@ You have access to E2B sandbox tools that allow you to:
 5. **Install packages** - Add npm dependencies
 6. **Run dev server** - Start Next.js development server with hot reload
 7. **Get preview URL** - Access the live running application
+
+## IMPORTANT: Running Applications
+
+When you finish building an application, you MUST:
+1. Run `npm install` using sandbox_run_command to install dependencies
+2. Use `sandbox_start_dev_server` tool to start the Next.js dev server - this runs in background and returns the preview URL
+3. Share the preview URL with the user so they can see their running app in the Preview panel
+
+NEVER tell the user to run commands themselves. YOU run everything in the sandbox.
+ALWAYS use sandbox_start_dev_server (not sandbox_run_command) to start the dev server - it handles background execution properly.
 
 ## Development Workflow
 
@@ -144,14 +165,15 @@ export function DataChart() {
 - Wrap chart libraries in client components ('use client')
 - Make charts responsive with proper container sizing
 
-### 6. Testing & Validation
+### 6. Running & Validation
 
-Before considering the app complete:
-1. **Start dev server** - Verify the app runs without errors
-2. **Check console** - No React warnings or errors
-3. **Test responsiveness** - Works on mobile and desktop
-4. **Validate data** - Data loads and displays correctly
-5. **Check types** - TypeScript compiles without errors
+Before considering the app complete, YOU MUST:
+1. **Install dependencies** - Run `npm install` in the sandbox
+2. **Start dev server** - Run `npm run dev &` in the sandbox (background process)
+3. **Get preview URL** - Call sandbox_get_preview_url and share it with the user
+4. **Verify** - The user will see their app running at the preview URL
+
+DO NOT ask the user to run commands - you have full control of the sandbox!
 
 ## Communication Style
 
@@ -209,26 +231,76 @@ If you encounter errors:
 Remember: Your goal is to build production-quality applications that are maintainable, performant, and delightful to use.
 """
 
+# Local mode specific instructions
+LOCAL_MODE_ADDENDUM = """
+
+## LOCAL MODE SPECIFIC INSTRUCTIONS
+
+You are running in LOCAL MODE, not E2B cloud sandbox. Important differences:
+
+1. **File paths**: All files are stored locally under `/tmp/app-builder/{session_id}/`. You should use RELATIVE paths from the project root (e.g., `app/page.tsx`, `package.json`), not absolute paths.
+
+2. **Preview URLs**: When the dev server starts, the preview URL will be `http://localhost:{port}`. The `sandbox_get_preview_url` tool returns the correct localhost URL - USE THIS VALUE, do not construct URLs yourself.
+
+3. **Do NOT generate E2B-style URLs** like `https://3000-{session}.preview.sandbox.anthropic.com`. Those are for cloud sandboxes only. In local mode, always use `http://localhost:{port}`.
+
+4. **Use relative paths** for all file operations. Do NOT use paths starting with `/private/tmp/` or `/tmp/`. Just use relative paths like:
+   - `package.json`
+   - `app/page.tsx`
+   - `components/Button.tsx`
+
+5. **After starting dev server**: Call `sandbox_get_preview_url` to get the correct localhost URL and share that with the user.
+"""
+
+# E2B cloud mode specific instructions
+E2B_MODE_ADDENDUM = """
+
+## E2B CLOUD MODE INSTRUCTIONS
+
+You are running in E2B cloud sandbox. The preview URLs will be in the format:
+`https://{port}-{sandbox_id}.preview.sandbox.anthropic.com`
+
+Use the `sandbox_get_preview_url` tool to get the correct preview URL after starting the dev server.
+"""
+
+
+def get_system_prompt() -> str:
+    """Get the full system prompt based on sandbox mode."""
+    mode = get_sandbox_mode()
+    if mode == "local":
+        return SYSTEM_PROMPT_BASE + LOCAL_MODE_ADDENDUM
+    else:
+        return SYSTEM_PROMPT_BASE + E2B_MODE_ADDENDUM
+
+
+logger = logging.getLogger(__name__)
+
 
 class AppBuilderAgent:
     """
     AppBuilderAgent wraps Claude Agent SDK to provide agentic workflow
-    for building Next.js/React/TypeScript applications in E2B sandboxes.
+    for building Next.js/React/TypeScript applications in sandboxes.
+
+    Supports both local sandbox mode (for development) and E2B cloud sandbox mode.
     """
 
-    def __init__(self, on_event: Optional[Callable] = None):
+    def __init__(self, session_id: Optional[str] = None, on_event: Optional[Callable] = None):
         """
         Initialize the AppBuilderAgent.
 
         Args:
+            session_id: Unique session identifier for logging context
             on_event: Optional callback for frontend notifications.
                      Called with event dict: {"type": "...", ...}
         """
+        self.session_id = session_id or "unknown"
         self.on_event = on_event
         self.client: Optional[ClaudeSDKClient] = None
-        self.sandbox_manager: Optional[SandboxManager] = None
+        self.sandbox_manager = None
         self.mcp_server = None
         self._initialized = False
+        self._sandbox_notified = False
+        logger.info(f"[{self.session_id}] AppBuilderAgent created")
 
     async def initialize(self) -> None:
         """
@@ -236,17 +308,28 @@ class AppBuilderAgent:
         Must be called before using chat().
         """
         if self._initialized:
+            logger.debug(f"[{self.session_id}] Agent already initialized, skipping")
             return
 
-        # Initialize sandbox manager
-        self.sandbox_manager = SandboxManager()
+        logger.info(f"[{self.session_id}] Initializing agent...")
+
+        # Initialize sandbox manager with session context
+        self.sandbox_manager = create_sandbox_manager(session_id=self.session_id)
 
         # Create MCP tools server for sandbox operations
         self.mcp_server = create_sandbox_tools_server(self.sandbox_manager)
 
-        # Configure Claude Agent SDK
+        # Get model from environment or use default
+        model = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
+        logger.info(f"[{self.session_id}] Using Claude model: {model}")
+
+        # Configure Claude Agent SDK with mode-specific system prompt
+        system_prompt = get_system_prompt()
+        logger.info(f"[{self.session_id}] Using sandbox mode: {get_sandbox_mode()}")
+
         options = ClaudeAgentOptions(
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=system_prompt,
+            model=model,
             mcp_servers={
                 "sandbox": self.mcp_server
             },
@@ -259,6 +342,7 @@ class AppBuilderAgent:
                 "mcp__sandbox__sandbox_run_command",
                 "mcp__sandbox__sandbox_install_packages",
                 "mcp__sandbox__sandbox_get_preview_url",
+                "mcp__sandbox__sandbox_start_dev_server",
             ],
             # Accept edits automatically for faster workflow
             permission_mode="acceptEdits",
@@ -269,6 +353,7 @@ class AppBuilderAgent:
         await self.client.connect()
 
         self._initialized = True
+        logger.info(f"[{self.session_id}] Agent initialized successfully")
 
     async def chat(self, message: str) -> AsyncIterator[dict]:
         """
@@ -288,9 +373,12 @@ class AppBuilderAgent:
             RuntimeError: If initialize() hasn't been called
         """
         if not self._initialized or not self.client:
+            logger.error(f"[{self.session_id}] chat() called before initialization")
             raise RuntimeError(
                 "AppBuilderAgent not initialized. Call initialize() first."
             )
+
+        logger.info(f"[{self.session_id}] Processing chat message: {message[:100]}{'...' if len(message) > 100 else ''}")
 
         # Send message to Claude
         await self.client.query(message)
@@ -299,21 +387,39 @@ class AppBuilderAgent:
         preview_url = None
 
         # Stream response from Claude
+        last_block_type = None
         async for msg in self.client.receive_response():
             if isinstance(msg, AssistantMessage):
                 # Process message content blocks
                 for block in msg.content:
                     if isinstance(block, TextBlock):
+                        # Add newline separator if coming after tool result
+                        text = block.text
+                        if last_block_type == 'tool_result':
+                            text = "\n\n" + text
+
                         # Stream text content
                         event = {
                             "type": "text",
-                            "content": block.text
+                            "content": text
                         }
                         if self.on_event:
                             self.on_event(event)
                         yield event
+                        last_block_type = 'text'
 
                     elif isinstance(block, ToolUseBlock):
+                        # Check if sandbox was created (lazy init) and notify
+                        if not self._sandbox_notified and self.sandbox_manager and self.sandbox_manager.is_initialized:
+                            self._sandbox_notified = True
+                            sandbox_event = {
+                                "type": "sandbox_ready",
+                                "sandbox_id": self.sandbox_manager.sandbox_id
+                            }
+                            if self.on_event:
+                                self.on_event(sandbox_event)
+                            yield sandbox_event
+
                         # Tool call event
                         event = {
                             "type": "tool_use",
@@ -323,11 +429,7 @@ class AppBuilderAgent:
                         if self.on_event:
                             self.on_event(event)
                         yield event
-
-                        # Track if we got preview URL from start_dev_server
-                        if block.name == "mcp__sandbox__start_dev_server":
-                            # Will get URL from tool result
-                            pass
+                        last_block_type = 'tool_use'
 
                     elif isinstance(block, ToolResultBlock):
                         # Tool result event
@@ -339,6 +441,7 @@ class AppBuilderAgent:
                         if self.on_event:
                             self.on_event(event)
                         yield event
+                        last_block_type = 'tool_result'
 
                         # Extract preview URL if available
                         if isinstance(block.content, dict):
@@ -354,6 +457,7 @@ class AppBuilderAgent:
         }
         if self.on_event:
             self.on_event(done_event)
+        logger.info(f"[{self.session_id}] Chat completed, preview_url={preview_url}")
         yield done_event
 
     async def cleanup(self) -> None:
@@ -361,16 +465,19 @@ class AppBuilderAgent:
         Cleanup resources (close MCP server, cleanup sandboxes, etc.)
         Should be called when done using the agent.
         """
+        logger.info(f"[{self.session_id}] Cleaning up agent resources...")
         try:
             # Disconnect Claude SDK client
             if self.client:
                 await self.client.disconnect()
                 self.client = None
+                logger.debug(f"[{self.session_id}] Claude SDK client disconnected")
 
             # Cleanup sandbox manager (will close any active sandboxes)
             if self.sandbox_manager:
                 await self.sandbox_manager.destroy()
                 self.sandbox_manager = None
+                logger.debug(f"[{self.session_id}] Sandbox manager destroyed")
 
             # Close MCP server
             if self.mcp_server:
@@ -378,9 +485,10 @@ class AppBuilderAgent:
                 if hasattr(self.mcp_server, 'close'):
                     await self.mcp_server.close()
                 self.mcp_server = None
+                logger.debug(f"[{self.session_id}] MCP server closed")
 
             self._initialized = False
+            logger.info(f"[{self.session_id}] Agent cleanup completed")
 
         except Exception as e:
-            # Log error but don't raise - cleanup should be best-effort
-            print(f"Error during cleanup: {e}")
+            logger.error(f"[{self.session_id}] Error during cleanup: {e}", exc_info=True)
