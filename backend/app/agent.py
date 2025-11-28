@@ -1,11 +1,32 @@
 #!/usr/bin/env python3
 """
 AppBuilderAgent - Claude Agent SDK wrapper for Next.js/React/TypeScript app builder.
-Provides agentic workflow for building data applications in sandboxes.
+
+AGENTIC IMPROVEMENTS IMPLEMENTATION:
+- Phase 2: Native Claude Code tools (Read, Write, Edit, Bash, Glob, Grep)
+- Phase 3: Specialized subagents (code-reviewer, error-fixer, component-generator)
+- Phase 4: Hooks for self-correction (PostToolUse) and logging (PreToolUse)
+- Phase 5: ClaudeSDKClient with conversation memory
+- Phase 6: Permission callbacks for security (can_use_tool)
+
+Features:
+- Native tools for file operations (Read, Write, Edit) in LOCAL mode
+- Native Bash for command execution with timeout support
+- Native Glob/Grep for file search
+- System prompt using preset + append pattern
+- MCP server only for E2B-specific tools (preview URL, dev server)
+- Subagents: code-reviewer (haiku), error-fixer (sonnet), component-generator (sonnet)
+- Self-correction hooks when build fails
+- Permission callback blocking dangerous commands and sensitive file access
+- Conversation memory across multiple chat turns
 """
 
 import logging
 import os
+import re
+import tempfile
+import time
+from pathlib import Path
 from typing import AsyncIterator, Callable, Optional
 
 from claude_agent_sdk import (
@@ -15,10 +36,13 @@ from claude_agent_sdk import (
     TextBlock,
     ToolUseBlock,
     ToolResultBlock,
+    HookMatcher,
+    AgentDefinition,
 )
 
 from .sandbox_factory import create_sandbox_manager
-from .tools.sandbox_tools import create_sandbox_tools_server
+from .tools.sandbox_tools import create_sandbox_tools_server, create_e2b_only_server
+from .logging_config import get_session_logger
 
 # Default model if not specified in environment
 DEFAULT_MODEL = "claude-sonnet-4-5"
@@ -29,7 +53,405 @@ def get_sandbox_mode() -> str:
     return os.getenv("SANDBOX_MODE", "local").lower()
 
 
-SYSTEM_PROMPT_BASE = """You are an expert Next.js/React/TypeScript developer building data-driven web applications in an isolated sandbox environment.
+# =============================================================================
+# SYSTEM PROMPT - Using preset + append pattern
+# =============================================================================
+
+SYSTEM_PROMPT_APPEND = """
+## App Builder Context
+
+You are building data-driven web applications in a sandbox environment.
+The sandbox has Next.js 14 with TypeScript, Tailwind CSS, and shadcn/ui pre-configured.
+
+### Your Capabilities
+
+**Native Tools (prefer these for file operations):**
+- `Read` - Read file contents (also supports images)
+- `Write` - Create or overwrite files
+- `Edit` - Make surgical changes to files (old_string → new_string) - PREFER THIS over Write for changes
+- `Bash` - Run shell commands (npm, node, etc.) with timeout support
+- `Glob` - Find files by pattern (e.g., `**/*.tsx`)
+- `Grep` - Search file contents with regex
+
+**Custom Tools (for sandbox-specific operations):**
+- `mcp__e2b__sandbox_get_preview_url` - Get the live preview URL
+- `mcp__e2b__sandbox_start_dev_server` - Start the Next.js dev server (ALWAYS use this, never run npm run dev via Bash!)
+
+### Workflow
+
+1. **Create** - Use `Write` to create new files
+2. **Edit** - Use `Edit` for modifications (NOT Write for existing files)
+3. **Verify** - Run `npm run build` via Bash to check for errors
+4. **Fix** - If errors, read the files and fix them
+5. **Preview** - Start dev server and provide preview URL
+
+### Code Quality
+
+- Always use TypeScript with proper types
+- Use 'use client' for interactive components
+- Follow React best practices (hooks, composition)
+- Make UI responsive with Tailwind CSS
+- Handle loading and error states
+
+### CRITICAL: next.config.js for Preview
+
+ALWAYS create this next.config.js to allow iframe preview:
+
+```javascript
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  async headers() {
+    return [
+      {
+        source: '/:path*',
+        headers: [
+          { key: 'X-Frame-Options', value: 'ALLOWALL' },
+          { key: 'Content-Security-Policy', value: "frame-ancestors 'self' http://localhost:* http://127.0.0.1:*" },
+        ],
+      },
+    ];
+  },
+};
+
+module.exports = nextConfig;
+```
+
+### Project Structure
+
+```
+/app
+  /layout.tsx          # Root layout
+  /page.tsx            # Home page
+  /api/                # API routes
+/components
+  /ui/                 # shadcn/ui components
+  /charts/             # Chart components
+/lib
+  /utils.ts            # Utility functions
+/types
+  /index.ts            # TypeScript types
+```
+
+### Running & Validation
+
+Before considering the app complete:
+1. Run `npm install` via Bash
+2. Run `npm run build` via Bash to verify no errors
+3. Use `mcp__e2b__sandbox_start_dev_server` to start the dev server
+4. The tool returns the preview URL - share it with the user
+
+### CRITICAL: Dev Server Rules
+
+**NEVER run `npm run dev` via Bash!** It will use port 3000 which conflicts with the frontend.
+**ALWAYS use `mcp__e2b__sandbox_start_dev_server` tool** - it automatically allocates a free port (3001+) and returns the correct preview URL.
+
+### Error Handling
+
+If build fails:
+1. Read the error message carefully
+2. Use Glob/Grep to find the problematic files
+3. Use Read to examine the context
+4. Use Edit to fix the issues surgically
+5. Run build again to verify
+
+### Subagents Available
+
+You can delegate tasks to specialized subagents using the Task tool:
+- `code-reviewer`: Reviews TypeScript/React code for errors. Use when build fails.
+- `error-fixer`: Fixes specific code errors identified by code-reviewer.
+- `component-generator`: Generates React components with TypeScript and Tailwind.
+"""
+
+# =============================================================================
+# SUBAGENTS - Specialized agents for different tasks
+# =============================================================================
+
+AGENTS = {
+    "code-reviewer": AgentDefinition(
+        description="Reviews TypeScript/React code for errors. Use when build fails or you need code review.",
+        prompt="""You are an expert TypeScript/React code reviewer.
+
+## Your Task
+Analyze error messages and source code to identify issues.
+
+## Process
+1. Read the error message carefully
+2. Use Grep to find the problematic code
+3. Use Read to examine the full context
+4. Identify the exact issue
+
+## Output Format
+For each issue found, report in this format:
+```
+FILE: path/to/file.tsx
+LINE: 42
+ISSUE: Brief description of the problem
+CONFIDENCE: 85%
+FIX: Suggested fix (be specific about what to change)
+```
+
+## Rules
+- Only report issues with confidence >= 80%
+- Focus on actual errors, not style preferences
+- Be specific about line numbers and fixes
+- Check for: missing imports, type errors, syntax errors, undefined variables
+""",
+        tools=["Read", "Grep", "Glob"],
+        model="haiku"  # Cost-effective for review tasks
+    ),
+
+    "error-fixer": AgentDefinition(
+        description="Fixes specific code errors identified by code-reviewer.",
+        prompt="""You are a precise code fixer.
+
+## Your Task
+Apply specific fixes to code based on error analysis.
+
+## Process
+1. Read the current file content
+2. Use Edit to make surgical changes (old_string → new_string)
+3. Verify the change makes sense in context
+
+## Rules
+- Use Edit tool, NOT Write (preserves more context)
+- Make minimal changes - fix only what's broken
+- One fix at a time
+- Preserve existing code style and formatting
+- After fixing, briefly explain what you changed
+
+## Common Fixes
+- Missing imports: Add the import at the top
+- Type errors: Add proper type annotations
+- Undefined variables: Check for typos or add declarations
+- Syntax errors: Fix brackets, semicolons, etc.
+""",
+        tools=["Read", "Edit"],
+        model="sonnet"
+    ),
+
+    "component-generator": AgentDefinition(
+        description="Generates React components with TypeScript and Tailwind. Use for creating new UI components.",
+        prompt="""You are a React component specialist.
+
+## Stack
+- React 18 with hooks
+- TypeScript strict mode
+- Tailwind CSS for styling
+- shadcn/ui for UI primitives
+
+## Component Structure
+```typescript
+'use client'  // Only if using hooks/state/effects
+
+import { ComponentType } from 'react'
+
+interface Props {
+  // Define all props with proper types
+}
+
+export default function ComponentName({ prop1, prop2 }: Props) {
+  // Implementation
+  return (
+    <div className="...">
+      {/* JSX */}
+    </div>
+  )
+}
+```
+
+## Rules
+- Use 'use client' ONLY for components with state, effects, or event handlers
+- Export as default
+- Include proper TypeScript types for all props
+- Make responsive with Tailwind (mobile-first)
+- Use semantic HTML elements
+- Include loading and error states where appropriate
+- Use Tailwind's design system (spacing: 4, 8, 16..., colors: slate, blue...)
+""",
+        tools=["Write", "Read"],
+        model="sonnet"
+    ),
+}
+
+
+# =============================================================================
+# HOOKS - Self-correction and logging
+# =============================================================================
+
+async def validate_build_result(
+    input_data: dict,
+    tool_use_id: str | None,
+    context: dict
+) -> dict:
+    """
+    PostToolUse hook - validates build results and triggers self-correction.
+
+    When `npm run build` or `npx tsc` fails, this hook adds a system message
+    instructing the agent to use subagents to analyze and fix the errors.
+    """
+    if input_data.get("tool_name") != "Bash":
+        return {}
+
+    tool_input = input_data.get("tool_input", {})
+    command = tool_input.get("command", "")
+    response = input_data.get("tool_response", {})
+
+    # Get exit code from response
+    exit_code = response.get("exitCode", 0)
+    output = response.get("output", "")
+
+    # Check if this is a build command
+    build_commands = ["npm run build", "npx tsc", "next build", "npm run type-check"]
+    is_build_command = any(cmd in command for cmd in build_commands)
+
+    if is_build_command and exit_code != 0:
+        # Build failed - trigger self-correction
+        logger.warning(f"Build failed (exit code {exit_code}), triggering self-correction")
+        return {
+            "systemMessage": f"""## Build Failed - Self-Correction Required
+
+The build command failed with exit code {exit_code}.
+
+### Error Output:
+```
+{output[:2000]}
+```
+
+### Required Actions:
+1. Use the `code-reviewer` subagent (via Task tool) to analyze these errors
+2. Use the `error-fixer` subagent (via Task tool) to fix each identified issue
+3. Run the build again to verify fixes
+
+Example Task tool usage:
+```
+Use Task tool with subagent_type="code-reviewer" to analyze the build errors above.
+```
+
+Do NOT proceed to preview until the build succeeds.
+"""
+        }
+
+    return {}
+
+
+async def log_tool_usage(
+    input_data: dict,
+    tool_use_id: str | None,
+    context: dict
+) -> dict:
+    """
+    PreToolUse hook - logs all tool calls for debugging and monitoring.
+    """
+    tool_name = input_data.get("tool_name", "unknown")
+    tool_input = input_data.get("tool_input", {})
+
+    # Log the tool call (truncate long inputs)
+    input_str = str(tool_input)
+    if len(input_str) > 200:
+        input_str = input_str[:200] + "..."
+
+    logger.info(f"[HOOK] Tool call: {tool_name}, input: {input_str}")
+
+    return {}
+
+
+# Hook configuration
+HOOKS = {
+    "PreToolUse": [
+        HookMatcher(hooks=[log_tool_usage]),
+    ],
+    "PostToolUse": [
+        HookMatcher(matcher="Bash", hooks=[validate_build_result]),
+    ],
+}
+
+
+# =============================================================================
+# PERMISSION CALLBACK - Dynamic tool access control
+# =============================================================================
+
+async def permission_callback(
+    tool_name: str,
+    input_data: dict,
+    context: dict
+) -> dict:
+    """
+    Dynamic permission control for tool usage.
+
+    This callback validates tool calls and can:
+    - Allow the call to proceed
+    - Deny the call with a message
+    - Modify the input (e.g., sanitize paths)
+
+    Returns:
+        dict with "behavior" key: "allow" or "deny"
+        Optional "message" for deny
+        Optional "updatedInput" for modified input
+    """
+    # Block dangerous Bash commands
+    if tool_name == "Bash":
+        command = input_data.get("command", "")
+
+        # Dangerous patterns that should never be allowed
+        dangerous_patterns = [
+            "rm -rf /",
+            "rm -rf ~",
+            "rm -rf *",
+            "sudo ",
+            "> /dev/",
+            "mkfs",
+            "dd if=",
+            ":(){:|:&};:",  # Fork bomb
+            "chmod -R 777 /",
+            "curl | bash",
+            "wget | bash",
+        ]
+
+        for pattern in dangerous_patterns:
+            if pattern in command:
+                logger.warning(f"[PERMISSION] Blocked dangerous command: {command}")
+                return {
+                    "behavior": "deny",
+                    "message": f"Dangerous command blocked: {pattern}"
+                }
+
+        # Warn about potentially dangerous commands (but allow them)
+        warning_patterns = ["rm -rf", "chmod 777", "npm run", "npx"]
+        for pattern in warning_patterns:
+            if pattern in command:
+                logger.info(f"[PERMISSION] Allowing potentially risky command: {command}")
+
+    # Block access to sensitive files
+    if tool_name in ["Read", "Write", "Edit"]:
+        file_path = input_data.get("file_path", "")
+
+        # Sensitive file patterns
+        sensitive_patterns = [
+            ".env",
+            "credentials",
+            "secrets",
+            ".git/config",
+            "id_rsa",
+            ".ssh/",
+            "password",
+            ".npmrc",
+        ]
+
+        file_path_lower = file_path.lower()
+        for pattern in sensitive_patterns:
+            if pattern in file_path_lower:
+                logger.warning(f"[PERMISSION] Blocked access to sensitive file: {file_path}")
+                return {
+                    "behavior": "deny",
+                    "message": f"Access to sensitive file denied: {file_path}"
+                }
+
+    # Allow all other operations
+    return {"behavior": "allow"}
+
+
+# Legacy system prompt for E2B mode (kept for backwards compatibility)
+LEGACY_SYSTEM_PROMPT = """You are an expert Next.js/React/TypeScript developer building data-driven web applications in an isolated sandbox environment.
 
 CRITICAL: You are working in a sandbox environment. ALL commands and file operations run INSIDE this sandbox. NEVER tell the user to run commands themselves - YOU must run everything in the sandbox using your tools.
 
@@ -51,226 +473,47 @@ You have access to sandbox tools that allow you to:
 6. **Run dev server** - Start Next.js development server with hot reload
 7. **Get preview URL** - Access the live running application
 
-## IMPORTANT: Running Applications
+## CRITICAL: Running Applications
 
-When you finish building an application, you MUST:
+When you finish building an application, you MUST follow this EXACT sequence:
 1. Run `npm install` using sandbox_run_command to install dependencies
 2. Use `sandbox_start_dev_server` tool to start the Next.js dev server - this runs in background and returns the preview URL
-3. Share the preview URL with the user so they can see their running app in the Preview panel
+3. The preview URL from sandbox_start_dev_server is the FINAL URL - share it with the user
+
+**CRITICAL RULES - VIOLATION WILL CAUSE ERRORS:**
+
+1. **NEVER run `npm run dev` via sandbox_run_command** - This will timeout and fail!
+   - GOOD: `sandbox_start_dev_server()` ✓
+
+2. **Port is AUTO-ALLOCATED (never 3000)** - Port 3000 is reserved for our frontend!
+
+3. **Only call sandbox_start_dev_server ONCE**
 
 NEVER tell the user to run commands themselves. YOU run everything in the sandbox.
-ALWAYS use sandbox_start_dev_server (not sandbox_run_command) to start the dev server - it handles background execution properly.
 
-## Development Workflow
+## CRITICAL: next.config.js for Preview
 
-When building an application, follow this systematic approach:
+ALWAYS create this next.config.js:
 
-### 1. Project Setup
-- Initialize Next.js project with TypeScript and Tailwind CSS
-- Set up the basic project structure (app/, components/, lib/, etc.)
-- Install essential dependencies (shadcn/ui, data viz libraries, etc.)
+```javascript
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  async headers() {
+    return [
+      {
+        source: '/:path*',
+        headers: [
+          { key: 'X-Frame-Options', value: 'ALLOWALL' },
+          { key: 'Content-Security-Policy', value: "frame-ancestors 'self' http://localhost:* http://127.0.0.1:*" },
+        ],
+      },
+    ];
+  },
+};
 
-### 2. File Structure
-Create a well-organized project:
+module.exports = nextConfig;
 ```
-/app
-  /layout.tsx          # Root layout
-  /page.tsx            # Home page
-  /api/                # API routes
-/components
-  /ui/                 # shadcn/ui components
-  /charts/             # Chart components
-  /tables/             # Table components
-/lib
-  /utils.ts            # Utility functions
-  /api.ts              # API clients
-/types
-  /index.ts            # TypeScript types
-```
-
-### 3. Code Quality Standards
-
-**TypeScript**
-- Use strict type checking
-- Define proper interfaces and types
-- Avoid `any` - use specific types or `unknown`
-- Use proper generics for reusable components
-
-**React Best Practices**
-- Use functional components with hooks
-- Implement proper error boundaries
-- Use React.memo() for expensive components
-- Leverage Suspense and loading states
-- Use server components by default, client components when needed
-
-**Next.js Patterns**
-- Use App Router (app/ directory)
-- Implement proper metadata for SEO
-- Use server actions for mutations
-- Implement proper loading and error states
-- Use dynamic imports for code splitting
-
-**Styling**
-- Use Tailwind CSS utility classes
-- Follow responsive design patterns (mobile-first)
-- Use shadcn/ui components for consistency
-- Implement dark mode support when appropriate
-
-### 4. Data Handling
-
-**For data visualization apps:**
-- Fetch data using server components or API routes
-- Implement proper loading states
-- Handle errors gracefully with error boundaries
-- Use React Query or SWR for client-side data fetching
-- Implement proper data transformations
-- Add pagination for large datasets
-
-**Common patterns:**
-```typescript
-// Server component data fetching
-async function getData() {
-  const res = await fetch('...', { cache: 'no-store' })
-  if (!res.ok) throw new Error('Failed to fetch')
-  return res.json()
-}
-
-// Client component with state
-'use client'
-import { useState, useEffect } from 'react'
-
-export function DataChart() {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
-
-  useEffect(() => {
-    fetchData().then(setData).finally(() => setLoading(false))
-  }, [])
-
-  if (loading) return <Skeleton />
-  return <Chart data={data} />
-}
-```
-
-### 5. Component Development
-
-**shadcn/ui Integration**
-- Always use shadcn/ui components for UI elements
-- Run `npx shadcn-ui@latest add <component>` to add components
-- Customize components in `components/ui/` as needed
-
-**Chart Components**
-- Use recharts for most charts (built on D3)
-- Use plotly.js for advanced interactive visualizations
-- Wrap chart libraries in client components ('use client')
-- Make charts responsive with proper container sizing
-
-### 6. Running & Validation
-
-Before considering the app complete, YOU MUST:
-1. **Install dependencies** - Run `npm install` in the sandbox
-2. **Start dev server** - Run `npm run dev &` in the sandbox (background process)
-3. **Get preview URL** - Call sandbox_get_preview_url and share it with the user
-4. **Verify** - The user will see their app running at the preview URL
-
-DO NOT ask the user to run commands - you have full control of the sandbox!
-
-## Communication Style
-
-When working on tasks:
-1. **Be explicit** - Explain what you're doing and why
-2. **Show progress** - Update the user as you create files and run commands
-3. **Handle errors** - If something fails, explain the error and fix it
-4. **Ask when unclear** - If requirements are ambiguous, ask for clarification
-5. **Provide context** - Explain architectural decisions
-
-## Example Interactions
-
-**User:** "Build a dashboard showing sales data with charts"
-
-**Your approach:**
-1. Create Next.js project with TypeScript
-2. Install dependencies (shadcn/ui, recharts)
-3. Set up project structure
-4. Create data API route or mock data
-5. Build chart components (bar chart, line chart, pie chart)
-6. Create dashboard layout with responsive grid
-7. Add loading states and error handling
-8. Start dev server and provide preview URL
-
-**User:** "Add a table with filtering and sorting"
-
-**Your approach:**
-1. Install shadcn/ui table component
-2. Create table component with TypeScript types
-3. Implement filtering logic with state
-4. Add sorting functionality
-5. Make it responsive (card view on mobile)
-6. Test and verify functionality
-
-## Important Notes
-
-- **Always use TypeScript** - No JavaScript files
-- **Modern React** - Use hooks, no class components
-- **App Router** - Use Next.js 14+ App Router, not Pages Router
-- **Responsive** - Every component should work on mobile
-- **Accessible** - Use semantic HTML and ARIA labels
-- **Performant** - Code split, lazy load, optimize images
-- **Type-safe** - Proper TypeScript throughout
-
-## Error Handling
-
-If you encounter errors:
-1. Read the error message carefully
-2. Check file paths and imports
-3. Verify package versions compatibility
-4. Ensure all dependencies are installed
-5. Check TypeScript types
-6. Restart dev server if needed
-
-Remember: Your goal is to build production-quality applications that are maintainable, performant, and delightful to use.
 """
-
-# Local mode specific instructions
-LOCAL_MODE_ADDENDUM = """
-
-## LOCAL MODE SPECIFIC INSTRUCTIONS
-
-You are running in LOCAL MODE, not E2B cloud sandbox. Important differences:
-
-1. **File paths**: All files are stored locally under `/tmp/app-builder/{session_id}/`. You should use RELATIVE paths from the project root (e.g., `app/page.tsx`, `package.json`), not absolute paths.
-
-2. **Preview URLs**: When the dev server starts, the preview URL will be `http://localhost:{port}`. The `sandbox_get_preview_url` tool returns the correct localhost URL - USE THIS VALUE, do not construct URLs yourself.
-
-3. **Do NOT generate E2B-style URLs** like `https://3000-{session}.preview.sandbox.anthropic.com`. Those are for cloud sandboxes only. In local mode, always use `http://localhost:{port}`.
-
-4. **Use relative paths** for all file operations. Do NOT use paths starting with `/private/tmp/` or `/tmp/`. Just use relative paths like:
-   - `package.json`
-   - `app/page.tsx`
-   - `components/Button.tsx`
-
-5. **After starting dev server**: Call `sandbox_get_preview_url` to get the correct localhost URL and share that with the user.
-"""
-
-# E2B cloud mode specific instructions
-E2B_MODE_ADDENDUM = """
-
-## E2B CLOUD MODE INSTRUCTIONS
-
-You are running in E2B cloud sandbox. The preview URLs will be in the format:
-`https://{port}-{sandbox_id}.preview.sandbox.anthropic.com`
-
-Use the `sandbox_get_preview_url` tool to get the correct preview URL after starting the dev server.
-"""
-
-
-def get_system_prompt() -> str:
-    """Get the full system prompt based on sandbox mode."""
-    mode = get_sandbox_mode()
-    if mode == "local":
-        return SYSTEM_PROMPT_BASE + LOCAL_MODE_ADDENDUM
-    else:
-        return SYSTEM_PROMPT_BASE + E2B_MODE_ADDENDUM
 
 
 logger = logging.getLogger(__name__)
@@ -281,7 +524,11 @@ class AppBuilderAgent:
     AppBuilderAgent wraps Claude Agent SDK to provide agentic workflow
     for building Next.js/React/TypeScript applications in sandboxes.
 
-    Supports both local sandbox mode (for development) and E2B cloud sandbox mode.
+    PHASE 2: Uses native Claude Code tools for LOCAL mode:
+    - Read, Write, Edit for file operations
+    - Bash for command execution
+    - Glob, Grep for file search
+    - MCP only for E2B-specific operations (preview URL, dev server)
     """
 
     def __init__(self, session_id: Optional[str] = None, on_event: Optional[Callable] = None):
@@ -300,41 +547,129 @@ class AppBuilderAgent:
         self.mcp_server = None
         self._initialized = False
         self._sandbox_notified = False
+        self._sandbox_path: Optional[Path] = None
+
+        # Initialize session logger
+        self.slogger = get_session_logger(self.session_id)
+        self.slogger.log_agent("INIT", "AppBuilderAgent created (Phase 2: native tools)")
+
         logger.info(f"[{self.session_id}] AppBuilderAgent created")
+
+    def _get_sandbox_path(self) -> Path:
+        """Get the sandbox directory path for this session."""
+        base_dir = Path(tempfile.gettempdir()) / "app-builder"
+        return base_dir / self.session_id
 
     async def initialize(self) -> None:
         """
-        Initialize the Claude SDK client with MCP sandbox tools.
-        Must be called before using chat().
+        Initialize the Claude SDK client.
+
+        In LOCAL mode: Uses native Claude Code tools with cwd set to sandbox path.
+        In E2B mode: Falls back to MCP tools for sandbox operations.
         """
         if self._initialized:
             logger.debug(f"[{self.session_id}] Agent already initialized, skipping")
             return
 
+        self.slogger.log_agent("INIT_START", "initializing agent...")
         logger.info(f"[{self.session_id}] Initializing agent...")
+
+        mode = get_sandbox_mode()
+        model = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
+        logger.info(f"[{self.session_id}] Using sandbox mode: {mode}, model: {model}")
+
+        if mode == "local":
+            await self._initialize_local_mode(model)
+        else:
+            await self._initialize_e2b_mode(model)
+
+        self._initialized = True
+        self.slogger.log_agent("INIT_DONE", f"model={model}, mode={mode}")
+        logger.info(f"[{self.session_id}] Agent initialized successfully")
+
+    async def _initialize_local_mode(self, model: str) -> None:
+        """Initialize agent for LOCAL mode with native tools."""
+
+        # Get sandbox path and ensure it exists
+        self._sandbox_path = self._get_sandbox_path()
+        self._sandbox_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"[{self.session_id}] Sandbox path: {self._sandbox_path}")
+
+        # Initialize sandbox manager for E2B-specific tools only
+        self.sandbox_manager = create_sandbox_manager(session_id=self.session_id)
+
+        # IMPORTANT: Initialize the sandbox to allocate a port
+        # This ensures preview_url is available even though native tools don't go through our manager
+        await self.sandbox_manager.ensure_sandbox()
+        logger.info(f"[{self.session_id}] Sandbox initialized, allocated port: {self.sandbox_manager._allocated_port}")
+
+        # Create minimal MCP server with only E2B-specific tools
+        self.mcp_server = create_e2b_only_server(self.sandbox_manager, session_id=self.session_id)
+
+        # Configure Claude Agent SDK with native tools and subagents
+        options = ClaudeAgentOptions(
+            # Set working directory to sandbox path - native tools will operate here
+            cwd=str(self._sandbox_path),
+
+            # Use Claude Code preset with our app builder additions
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                "append": SYSTEM_PROMPT_APPEND,
+            },
+
+            model=model,
+
+            # Native tools + E2B MCP tools + Task for subagents
+            allowed_tools=[
+                # Native Claude Code tools
+                "Read", "Write", "Edit",
+                "Bash",
+                "Glob", "Grep",
+                "Task",  # For spawning subagents
+                # E2B-specific MCP tools (note: includes 'sandbox_' prefix from tool function names)
+                "mcp__e2b__sandbox_get_preview_url",
+                "mcp__e2b__sandbox_start_dev_server",
+            ],
+
+            # E2B MCP server for preview URL and dev server
+            mcp_servers={
+                "e2b": self.mcp_server
+            },
+
+            # Specialized subagents for code review, error fixing, and component generation
+            agents=AGENTS,
+
+            # Hooks for self-correction and logging
+            hooks=HOOKS,
+
+            # Permission callback for dynamic tool access control
+            can_use_tool=permission_callback,
+
+            # Accept edits automatically for faster workflow
+            permission_mode="acceptEdits",
+        )
+
+        # Create and connect client
+        self.client = ClaudeSDKClient(options)
+        await self.client.connect()
+
+    async def _initialize_e2b_mode(self, model: str) -> None:
+        """Initialize agent for E2B cloud mode with MCP tools (legacy approach)."""
 
         # Initialize sandbox manager with session context
         self.sandbox_manager = create_sandbox_manager(session_id=self.session_id)
 
-        # Create MCP tools server for sandbox operations
-        self.mcp_server = create_sandbox_tools_server(self.sandbox_manager)
+        # Create full MCP tools server for E2B operations
+        self.mcp_server = create_sandbox_tools_server(self.sandbox_manager, session_id=self.session_id)
 
-        # Get model from environment or use default
-        model = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
-        logger.info(f"[{self.session_id}] Using Claude model: {model}")
-
-        # Configure Claude Agent SDK with mode-specific system prompt
-        system_prompt = get_system_prompt()
-        logger.info(f"[{self.session_id}] Using sandbox mode: {get_sandbox_mode()}")
-
+        # Configure Claude Agent SDK with MCP tools (legacy approach)
         options = ClaudeAgentOptions(
-            system_prompt=system_prompt,
+            system_prompt=LEGACY_SYSTEM_PROMPT,
             model=model,
             mcp_servers={
                 "sandbox": self.mcp_server
             },
-            # Allow sandbox tools for file operations, command execution, etc.
-            # Note: tool names are mcp__{server_name}__{tool_name}
             allowed_tools=[
                 "mcp__sandbox__sandbox_write_file",
                 "mcp__sandbox__sandbox_read_file",
@@ -344,16 +679,12 @@ class AppBuilderAgent:
                 "mcp__sandbox__sandbox_get_preview_url",
                 "mcp__sandbox__sandbox_start_dev_server",
             ],
-            # Accept edits automatically for faster workflow
             permission_mode="acceptEdits",
         )
 
         # Create and connect client
         self.client = ClaudeSDKClient(options)
         await self.client.connect()
-
-        self._initialized = True
-        logger.info(f"[{self.session_id}] Agent initialized successfully")
 
     async def chat(self, message: str) -> AsyncIterator[dict]:
         """
@@ -378,6 +709,9 @@ class AppBuilderAgent:
                 "AppBuilderAgent not initialized. Call initialize() first."
             )
 
+        # Generate message ID for tracking
+        msg_id = f"req_{int(time.time()*1000)}"
+        self.slogger.log_agent("CHAT_START", f"msg_id={msg_id}, len={len(message)}")
         logger.info(f"[{self.session_id}] Processing chat message: {message[:100]}{'...' if len(message) > 100 else ''}")
 
         # Send message to Claude
@@ -386,6 +720,11 @@ class AppBuilderAgent:
         # Track if we've started a dev server to get preview URL
         preview_url = None
 
+        # Track blocks for summary logging
+        text_block_count = 0
+        tool_use_count = 0
+        tool_result_count = 0
+
         # Stream response from Claude
         last_block_type = None
         async for msg in self.client.receive_response():
@@ -393,12 +732,15 @@ class AppBuilderAgent:
                 # Process message content blocks
                 for block in msg.content:
                     if isinstance(block, TextBlock):
-                        # Add newline separator if coming after tool result
+                        # Add separator if coming after tool use/result for visual break
                         text = block.text
-                        if last_block_type == 'tool_result':
-                            text = "\n\n" + text
+                        if last_block_type in ('tool_result', 'tool_use'):
+                            text = "\n\n---\n\n" + text
 
-                        # Stream text content
+                        # Log text block
+                        self.slogger.log_agent("TEXT_BLOCK", f"len={len(block.text)}")
+                        text_block_count += 1
+
                         event = {
                             "type": "text",
                             "content": text
@@ -420,7 +762,15 @@ class AppBuilderAgent:
                                 self.on_event(sandbox_event)
                             yield sandbox_event
 
-                        # Tool call event
+                        # Log tool use block with detailed input info
+                        input_keys = list(block.input.keys()) if isinstance(block.input, dict) else str(type(block.input))
+                        self.slogger.log_agent("TOOL_USE_BLOCK", f"tool={block.name}, id={block.id}, input_keys={input_keys}")
+                        tool_use_count += 1
+
+                        # Debug logging for Write tool
+                        if block.name == "Write":
+                            logger.info(f"[{self.session_id}] Write tool input: {list(block.input.keys()) if isinstance(block.input, dict) else block.input}")
+
                         event = {
                             "type": "tool_use",
                             "tool": block.name,
@@ -432,7 +782,12 @@ class AppBuilderAgent:
                         last_block_type = 'tool_use'
 
                     elif isinstance(block, ToolResultBlock):
-                        # Tool result event
+                        # Log tool result block
+                        content_type = type(block.content).__name__
+                        content_preview = str(block.content)[:200] if block.content else "None"
+                        self.slogger.log_agent("TOOL_RESULT_BLOCK", f"id={block.tool_use_id}, content_type={content_type}")
+                        tool_result_count += 1
+
                         event = {
                             "type": "tool_result",
                             "tool": block.tool_use_id,
@@ -444,11 +799,15 @@ class AppBuilderAgent:
                         last_block_type = 'tool_result'
 
                         # Extract preview URL if available
-                        if isinstance(block.content, dict):
-                            if "preview_url" in block.content:
-                                preview_url = block.content["preview_url"]
-                            elif "url" in block.content:
-                                preview_url = block.content["url"]
+                        content = block.content
+                        preview_url = self._extract_preview_url(content) or preview_url
+
+        # If we didn't get preview URL from tool results, try sandbox manager
+        if not preview_url and self.sandbox_manager:
+            manager_preview_url = self.sandbox_manager.preview_url
+            if manager_preview_url:
+                preview_url = manager_preview_url
+                self.slogger.log_agent("PREVIEW_URL_FOUND", f"source=sandbox_manager, url={preview_url}")
 
         # Send done event with preview URL if available
         done_event = {
@@ -457,8 +816,48 @@ class AppBuilderAgent:
         }
         if self.on_event:
             self.on_event(done_event)
+
+        # Log chat completion
+        self.slogger.log_agent(
+            "CHAT_END",
+            f"msg_id={msg_id}, text_blocks={text_block_count}, "
+            f"tool_uses={tool_use_count}, tool_results={tool_result_count}, "
+            f"preview_url={preview_url}"
+        )
         logger.info(f"[{self.session_id}] Chat completed, preview_url={preview_url}")
         yield done_event
+
+    def _extract_preview_url(self, content) -> Optional[str]:
+        """Extract preview URL from tool result content."""
+        # Handle dict content
+        if isinstance(content, dict):
+            if "preview_url" in content:
+                return content["preview_url"]
+            elif "url" in content:
+                return content["url"]
+
+        # Handle list content
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    if "preview_url" in item:
+                        return item["preview_url"]
+                    elif "url" in item:
+                        return item["url"]
+                    elif "text" in item and isinstance(item["text"], str):
+                        text = item["text"]
+                        if "http://localhost:" in text:
+                            match = re.search(r'http://localhost:\d+', text)
+                            if match:
+                                return match.group(0)
+
+        # Handle string content
+        elif isinstance(content, str) and "http://localhost:" in content:
+            match = re.search(r'http://localhost:\d+', content)
+            if match:
+                return match.group(0)
+
+        return None
 
     async def cleanup(self) -> None:
         """
@@ -473,7 +872,7 @@ class AppBuilderAgent:
                 self.client = None
                 logger.debug(f"[{self.session_id}] Claude SDK client disconnected")
 
-            # Cleanup sandbox manager (will close any active sandboxes)
+            # Cleanup sandbox manager
             if self.sandbox_manager:
                 await self.sandbox_manager.destroy()
                 self.sandbox_manager = None
@@ -481,7 +880,6 @@ class AppBuilderAgent:
 
             # Close MCP server
             if self.mcp_server:
-                # MCP server cleanup (if it has a close method)
                 if hasattr(self.mcp_server, 'close'):
                     await self.mcp_server.close()
                 self.mcp_server = None

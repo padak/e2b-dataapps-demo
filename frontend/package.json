@@ -10,11 +10,14 @@
   },
   "dependencies": {
     "@codemirror/lang-python": "^6.1.6",
+    "@tailwindcss/typography": "^0.5.19",
     "@uiw/react-codemirror": "^4.23.0",
     "framer-motion": "^11.11.0",
     "lucide-react": "^0.460.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "react-router-dom": "^7.9.6",
     "zustand": "^5.0.8"
   },
   "devDependencies": {

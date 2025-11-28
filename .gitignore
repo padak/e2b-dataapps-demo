@@ -25,5 +25,8 @@ pip-log.txt
 # E2B
 .e2b/
 
+# Logs
+logs/
+
 # Frontend
 frontend/node_modules/

@@ -3,14 +3,17 @@ import { Message } from '../types/chat';
 
 interface AppState {
   sessionId: string | null;
+  sandboxId: string | null;
   messages: Message[];
   previewUrl: string | null;
   isConnected: boolean;
   isLoading: boolean;
 
   setSessionId: (id: string) => void;
+  setSandboxId: (id: string | null) => void;
   addMessage: (message: Message) => void;
   appendToLastMessage: (content: string) => void;
+  appendToMessage: (messageId: string, content: string) => void;
   setPreviewUrl: (url: string | null) => void;
   setConnected: (connected: boolean) => void;
   setLoading: (loading: boolean) => void;
@@ -19,6 +22,7 @@ interface AppState {
 
 const initialState = {
   sessionId: null,
+  sandboxId: null,
   messages: [],
   previewUrl: null,
   isConnected: false,
@@ -30,6 +34,9 @@ export const useAppStore = create<AppState>((set) => ({
 
   setSessionId: (id: string) =>
     set({ sessionId: id }),
+
+  setSandboxId: (id: string | null) =>
+    set({ sandboxId: id }),
 
   addMessage: (message: Message) =>
     set((state) => ({
@@ -57,6 +64,16 @@ export const useAppStore = create<AppState>((set) => ({
         content: messages[lastIndex].content + content,
       };
 
+      return { messages };
+    }),
+
+  appendToMessage: (messageId: string, content: string) =>
+    set((state) => {
+      const messages = state.messages.map(msg =>
+        msg.id === messageId
+          ? { ...msg, content: msg.content + content }
+          : msg
+      );
       return { messages };
     }),
 

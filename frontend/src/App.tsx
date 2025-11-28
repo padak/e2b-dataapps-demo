@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
+import { Link } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Play,
@@ -14,7 +15,7 @@ import {
   Minimize2,
   PanelLeftClose,
   PanelLeft,
-  
+  MessageSquare,
 } from 'lucide-react';
 
 import CodeEditor from './components/CodeEditor';
@@ -323,6 +324,16 @@ export default function App() {
               >
                 <Settings className="w-5 h-5" />
               </button>
+
+              {/* App Builder Link */}
+              <Link
+                to="/"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[var(--color-border)] text-[var(--color-muted)] hover:text-accent-purple hover:border-accent-purple transition-colors text-sm"
+                title="App Builder"
+              >
+                <MessageSquare className="w-4 h-4" />
+                <span className="hidden sm:inline">App Builder</span>
+              </Link>
 
               {/* Theme Toggle */}
               <ThemeToggle theme={theme} setTheme={setTheme} />

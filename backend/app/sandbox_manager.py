@@ -8,7 +8,6 @@ and cleanup of E2B sandboxes with lazy initialization and comprehensive error ha
 import asyncio
 import logging
 from typing import Optional, Dict, Any, List
-from pathlib import Path
 
 from e2b_code_interpreter import Sandbox
 
@@ -45,134 +44,82 @@ class SandboxManager:
     """
     Manages E2B sandbox lifecycle with lazy initialization.
 
-    This class provides a high-level interface for managing E2B sandboxes,
-    including file operations, command execution, and preview URL generation.
-    The sandbox is created lazily on first use and can be destroyed when no longer needed.
-
-    Attributes:
-        _sandbox: The E2B Sandbox instance (None until initialized)
-        _template: Template name for sandbox creation
-        _timeout_ms: Sandbox timeout in milliseconds
-        _is_initialized: Flag indicating if sandbox has been created
-
-    Example:
-        ```python
-        manager = SandboxManager()
-
-        # Sandbox is created on first use
-        await manager.write_file("/home/user/app.py", "print('Hello')")
-
-        # Execute code
-        result = await manager.run_command("python /home/user/app.py")
-        print(result['stdout'])
-
-        # Get preview URL
-        url = await manager.get_preview_url(8501)
-
-        # Cleanup
-        await manager.destroy()
-        ```
+    Note: E2B SDK is synchronous, so we use asyncio.to_thread() to run
+    blocking operations without blocking the event loop.
     """
 
-    def __init__(self, template: str = "base", timeout_minutes: int = 15):
+    def __init__(
+        self,
+        template: str = "keboola-apps-builder",
+        timeout_seconds: int = 1800,
+        session_id: Optional[str] = None
+    ):
         """
         Initialize the SandboxManager.
 
         Args:
-            template: E2B template name to use for sandbox creation (default: "base")
-            timeout_minutes: Sandbox timeout in minutes (default: 15)
+            template: E2B template name to use for sandbox creation
+            timeout_seconds: Sandbox timeout in seconds (default: 1800 = 30 minutes)
+            session_id: Unique session identifier for logging context
         """
         self._sandbox: Optional[Sandbox] = None
         self._template: str = template
-        self._timeout_ms: int = timeout_minutes * 60 * 1000
+        self._timeout: int = timeout_seconds
         self._is_initialized: bool = False
+        self._session_id: str = session_id or "unknown"
 
         logger.info(
-            f"SandboxManager initialized with template='{template}', "
-            f"timeout={timeout_minutes}min"
+            f"[{self._session_id}] SandboxManager initialized with template='{template}', "
+            f"timeout={timeout_seconds}s"
         )
 
+    def _create_sandbox_sync(self, template: str) -> Sandbox:
+        """Synchronous sandbox creation."""
+        logger.info(f"[{self._session_id}] Calling Sandbox.create(template='{template}', timeout={self._timeout})")
+        sandbox = Sandbox.create(template=template, timeout=self._timeout)
+        logger.info(f"[{self._session_id}] Sandbox created: {sandbox.sandbox_id}")
+        return sandbox
+
     async def ensure_sandbox(self, template: Optional[str] = None) -> Sandbox:
-        """
-        Ensure sandbox is created and return it (lazy initialization).
-
-        This method creates the sandbox on first call and returns the existing
-        instance on subsequent calls. It's idempotent and safe to call multiple times.
-
-        Args:
-            template: Optional template override. If provided, will use this template
-                     instead of the default. Only applies on first initialization.
-
-        Returns:
-            Sandbox: The initialized E2B Sandbox instance
-
-        Raises:
-            SandboxInitializationError: If sandbox creation fails
-
-        Example:
-            ```python
-            sandbox = await manager.ensure_sandbox()
-            # Use sandbox directly if needed
-            ```
-        """
+        """Ensure sandbox is created and return it (lazy initialization)."""
         if self._is_initialized and self._sandbox is not None:
-            logger.debug("Sandbox already initialized, returning existing instance")
+            logger.debug(f"[{self._session_id}] Sandbox already initialized, returning existing instance")
             return self._sandbox
 
         template_to_use = template or self._template
 
         try:
             logger.info(
-                f"Creating sandbox with template='{template_to_use}', "
-                f"timeout={self._timeout_ms}ms"
+                f"[{self._session_id}] Creating sandbox with template='{template_to_use}', "
+                f"timeout={self._timeout}s"
             )
 
-            self._sandbox = await Sandbox.create(
-                template=template_to_use,
-                timeout=self._timeout_ms
+            # Run synchronous E2B creation in thread pool
+            self._sandbox = await asyncio.to_thread(
+                self._create_sandbox_sync, template_to_use
             )
 
             self._is_initialized = True
-            logger.info(f"Sandbox created successfully with ID: {self._sandbox.sandbox_id}")
+            logger.info(f"[{self._session_id}] Sandbox created successfully with ID: {self._sandbox.sandbox_id}")
 
             return self._sandbox
 
         except Exception as e:
-            error_msg = f"Failed to create sandbox with template '{template_to_use}': {str(e)}"
+            error_msg = f"[{self._session_id}] Failed to create sandbox with template '{template_to_use}': {str(e)}"
             logger.error(error_msg, exc_info=True)
             raise SandboxInitializationError(error_msg) from e
 
     async def write_file(self, path: str, content: str) -> Dict[str, Any]:
-        """
-        Write content to a file in the sandbox.
-
-        Args:
-            path: Absolute path where the file should be written in the sandbox
-            content: File content as a string
-
-        Returns:
-            dict: Result dictionary with:
-                - success (bool): Whether the operation succeeded
-                - path (str): The path where the file was written
-                - size (int): Size of the written content in bytes
-
-        Raises:
-            SandboxFileOperationError: If file write operation fails
-
-        Example:
-            ```python
-            result = await manager.write_file(
-                "/home/user/app.py",
-                "import streamlit as st\\nst.write('Hello')"
-            )
-            print(f"Wrote {result['size']} bytes to {result['path']}")
-            ```
-        """
+        """Write content to a file in the sandbox."""
         try:
             sandbox = await self.ensure_sandbox()
-            logger.debug(f"Writing file to path: {path}")
+            logger.debug(f"[{self._session_id}] Writing file to path: {path}")
 
-            await sandbox.files.write(path, content)
+            # Keep sandbox alive on activity
+            await self.keep_alive()
+
+            # Run synchronous file write in thread pool
+            await asyncio.to_thread(sandbox.files.write, path, content)
 
             result = {
                 "success": True,
@@ -180,161 +127,184 @@ class SandboxManager:
                 "size": len(content.encode('utf-8'))
             }
 
-            logger.info(f"Successfully wrote {result['size']} bytes to {path}")
+            logger.info(f"[{self._session_id}] Successfully wrote {result['size']} bytes to {path}")
             return result
 
         except SandboxInitializationError:
             raise
         except Exception as e:
-            error_msg = f"Failed to write file to '{path}': {str(e)}"
+            error_msg = f"[{self._session_id}] Failed to write file to '{path}': {str(e)}"
             logger.error(error_msg, exc_info=True)
             raise SandboxFileOperationError(error_msg) from e
 
     async def read_file(self, path: str) -> str:
-        """
-        Read content from a file in the sandbox.
-
-        Args:
-            path: Absolute path to the file in the sandbox
-
-        Returns:
-            str: File content as a string
-
-        Raises:
-            SandboxFileOperationError: If file read operation fails
-
-        Example:
-            ```python
-            content = await manager.read_file("/home/user/app.py")
-            print(content)
-            ```
-        """
+        """Read content from a file in the sandbox."""
         try:
             sandbox = await self.ensure_sandbox()
-            logger.debug(f"Reading file from path: {path}")
+            logger.debug(f"[{self._session_id}] Reading file from path: {path}")
 
-            content = await sandbox.files.read(path)
+            # Run synchronous file read in thread pool
+            content = await asyncio.to_thread(sandbox.files.read, path)
 
-            logger.info(f"Successfully read {len(content)} bytes from {path}")
+            logger.info(f"[{self._session_id}] Successfully read {len(content)} bytes from {path}")
             return content
 
         except SandboxInitializationError:
             raise
         except Exception as e:
-            error_msg = f"Failed to read file from '{path}': {str(e)}"
+            error_msg = f"[{self._session_id}] Failed to read file from '{path}': {str(e)}"
             logger.error(error_msg, exc_info=True)
             raise SandboxFileOperationError(error_msg) from e
 
-    async def run_command(self, command: str, timeout: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Execute a shell command in the sandbox.
+    async def run_command(self, command: str, timeout: Optional[int] = 120, background: bool = False) -> Dict[str, Any]:
+        """Execute a shell command in the sandbox.
 
         Args:
             command: Shell command to execute
-            timeout: Optional timeout in seconds (defaults to None for no timeout)
-
-        Returns:
-            dict: Command execution result with:
-                - stdout (str): Standard output from the command
-                - stderr (str): Standard error from the command
-                - exit_code (int): Command exit code (0 indicates success)
-                - success (bool): True if exit_code is 0
-
-        Raises:
-            SandboxCommandError: If command execution fails
-
-        Example:
-            ```python
-            result = await manager.run_command("pip install pandas")
-            if result['success']:
-                print("Installation successful")
-            else:
-                print(f"Error: {result['stderr']}")
-            ```
+            timeout: Command timeout in seconds (default 120, use 0 for no timeout)
+            background: If True, start process in background and return immediately
         """
         try:
             sandbox = await self.ensure_sandbox()
-            logger.debug(f"Executing command: {command}")
+            logger.info(f"[{self._session_id}] Executing command: {command[:80]}{'...' if len(command) > 80 else ''} (timeout={timeout}s, background={background})")
 
-            if timeout:
-                exec_result = await asyncio.wait_for(
-                    sandbox.commands.run(command),
+            # Keep sandbox alive on activity
+            await self.keep_alive()
+
+            if background:
+                # For background processes (like dev servers), use nohup and redirect output
+                bg_command = f"nohup {command} > /tmp/cmd_output.log 2>&1 &"
+                exec_result = await asyncio.to_thread(
+                    sandbox.commands.run,
+                    bg_command,
+                    timeout=10  # Short timeout for background start
+                )
+                # Give process time to start
+                await asyncio.sleep(2)
+                logger.info(f"[{self._session_id}] Background process started")
+                return {
+                    "stdout": "Process started in background",
+                    "stderr": "",
+                    "exit_code": 0,
+                    "success": True,
+                    "background": True
+                }
+            else:
+                # Regular command with timeout
+                exec_result = await asyncio.to_thread(
+                    sandbox.commands.run,
+                    command,
                     timeout=timeout
                 )
-            else:
-                exec_result = await sandbox.commands.run(command)
 
-            result = {
-                "stdout": exec_result.stdout,
-                "stderr": exec_result.stderr,
-                "exit_code": exec_result.exit_code,
-                "success": exec_result.exit_code == 0
-            }
+                result = {
+                    "stdout": exec_result.stdout,
+                    "stderr": exec_result.stderr,
+                    "exit_code": exec_result.exit_code,
+                    "success": exec_result.exit_code == 0
+                }
 
-            if result['success']:
-                logger.info(
-                    f"Command executed successfully: {command[:50]}... "
-                    f"(exit_code={result['exit_code']})"
-                )
-            else:
-                logger.warning(
-                    f"Command failed: {command[:50]}... "
-                    f"(exit_code={result['exit_code']}, stderr={result['stderr'][:100]})"
-                )
+                if result['success']:
+                    logger.info(
+                        f"[{self._session_id}] Command executed successfully: {command[:50]}... "
+                        f"(exit_code={result['exit_code']})"
+                    )
+                else:
+                    logger.warning(
+                        f"[{self._session_id}] Command failed: {command[:50]}... "
+                        f"(exit_code={result['exit_code']}, stderr={result['stderr'][:100] if result['stderr'] else ''})"
+                    )
 
-            return result
+                return result
 
-        except asyncio.TimeoutError:
-            error_msg = f"Command timed out after {timeout}s: {command}"
-            logger.error(error_msg)
-            raise SandboxCommandError(error_msg)
         except SandboxInitializationError:
             raise
         except Exception as e:
-            error_msg = f"Failed to execute command '{command}': {str(e)}"
+            error_msg = f"[{self._session_id}] Failed to execute command '{command[:50]}': {str(e)}"
             logger.error(error_msg, exc_info=True)
             raise SandboxCommandError(error_msg) from e
 
-    async def list_files(self, path: str = "/home/user") -> List[str]:
-        """
-        List files in a directory in the sandbox.
+    async def start_dev_server(self, project_dir: str = ".", port: int = 3000) -> Dict[str, Any]:
+        """Start a development server in the background and return preview URL.
 
         Args:
-            path: Directory path to list (default: "/home/user")
+            project_dir: Directory containing the project (default: current dir)
+            port: Port to run the server on (default: 3000)
 
         Returns:
-            list: List of file/directory names in the specified path
-
-        Raises:
-            SandboxFileOperationError: If directory listing fails
-
-        Example:
-            ```python
-            files = await manager.list_files("/home/user")
-            for file in files:
-                print(file)
-            ```
+            Dict with preview_url and status
         """
         try:
             sandbox = await self.ensure_sandbox()
-            logger.debug(f"Listing files in path: {path}")
+
+            # Start dev server in background
+            command = f"cd {project_dir} && PORT={port} npm run dev"
+            logger.info(f"[{self._session_id}] Starting dev server: {command}")
+
+            # Use nohup to keep process running
+            bg_command = f"nohup sh -c '{command}' > /tmp/dev_server.log 2>&1 &"
+            await asyncio.to_thread(
+                sandbox.commands.run,
+                bg_command,
+                timeout=10
+            )
+
+            # Wait for server to start
+            logger.info(f"[{self._session_id}] Waiting for dev server to start...")
+            await asyncio.sleep(5)
+
+            # Check if server is running
+            check_result = await asyncio.to_thread(
+                sandbox.commands.run,
+                f"curl -s -o /dev/null -w '%{{http_code}}' http://localhost:{port} || echo 'not ready'",
+                timeout=10
+            )
+
+            # Get preview URL
+            host = sandbox.get_host(port)
+            preview_url = f"https://{host}"
+
+            logger.info(f"[{self._session_id}] Dev server started, preview URL: {preview_url}")
+
+            return {
+                "success": True,
+                "preview_url": preview_url,
+                "port": port,
+                "message": f"Dev server started on port {port}"
+            }
+
+        except Exception as e:
+            error_msg = f"[{self._session_id}] Failed to start dev server: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            return {
+                "success": False,
+                "error": error_msg
+            }
+
+    async def list_files(self, path: str = "/home/user") -> List[str]:
+        """List files in a directory in the sandbox."""
+        try:
+            sandbox = await self.ensure_sandbox()
+            logger.debug(f"[{self._session_id}] Listing files in path: {path}")
 
             # Use ls command to list files
-            result = await sandbox.commands.run(f"ls -1 {path}")
+            exec_result = await asyncio.to_thread(
+                sandbox.commands.run, f"ls -1 {path}"
+            )
 
-            if result.exit_code != 0:
+            if exec_result.exit_code != 0:
                 raise SandboxFileOperationError(
-                    f"Failed to list directory '{path}': {result.stderr}"
+                    f"Failed to list directory '{path}': {exec_result.stderr}"
                 )
 
             # Parse output into list of files
             files = [
                 line.strip()
-                for line in result.stdout.strip().split('\n')
+                for line in exec_result.stdout.strip().split('\n')
                 if line.strip()
             ]
 
-            logger.info(f"Found {len(files)} items in {path}")
+            logger.info(f"[{self._session_id}] Found {len(files)} items in {path}")
             return files
 
         except SandboxInitializationError:
@@ -342,137 +312,83 @@ class SandboxManager:
         except SandboxFileOperationError:
             raise
         except Exception as e:
-            error_msg = f"Failed to list files in '{path}': {str(e)}"
+            error_msg = f"[{self._session_id}] Failed to list files in '{path}': {str(e)}"
             logger.error(error_msg, exc_info=True)
             raise SandboxFileOperationError(error_msg) from e
 
     async def get_preview_url(self, port: int = 3000) -> str:
-        """
-        Get the preview URL for a service running on the specified port.
-
-        This generates a publicly accessible URL for services running inside the sandbox,
-        commonly used for web applications like Streamlit (port 8501), React dev servers
-        (port 3000), or other web services.
-
-        Args:
-            port: Port number where the service is running (default: 3000)
-
-        Returns:
-            str: Public HTTPS URL to access the service
-
-        Raises:
-            SandboxInitializationError: If sandbox is not initialized
-
-        Example:
-            ```python
-            # Start a Streamlit app
-            await manager.run_command("streamlit run app.py --server.port 8501 &")
-
-            # Get the preview URL
-            url = await manager.get_preview_url(8501)
-            print(f"App available at: {url}")
-            ```
-        """
+        """Get the preview URL for a service running on the specified port."""
         try:
             sandbox = await self.ensure_sandbox()
 
+            # get_host is synchronous
             host = sandbox.get_host(port)
             url = f"https://{host}"
 
-            logger.info(f"Generated preview URL for port {port}: {url}")
+            logger.info(f"[{self._session_id}] Generated preview URL for port {port}: {url}")
             return url
 
         except SandboxInitializationError:
             raise
         except Exception as e:
-            error_msg = f"Failed to get preview URL for port {port}: {str(e)}"
+            error_msg = f"[{self._session_id}] Failed to get preview URL for port {port}: {str(e)}"
             logger.error(error_msg, exc_info=True)
             raise SandboxError(error_msg) from e
 
     async def destroy(self) -> None:
-        """
-        Destroy the sandbox and cleanup resources.
-
-        This method should be called when the sandbox is no longer needed to free up
-        resources. It's idempotent and safe to call multiple times.
-
-        Raises:
-            SandboxError: If sandbox destruction fails
-
-        Example:
-            ```python
-            try:
-                # Use sandbox...
-                await manager.write_file("/home/user/app.py", "...")
-            finally:
-                # Always cleanup
-                await manager.destroy()
-            ```
-        """
+        """Destroy the sandbox and cleanup resources."""
         if not self._is_initialized or self._sandbox is None:
-            logger.debug("Sandbox not initialized, nothing to destroy")
+            logger.debug(f"[{self._session_id}] Sandbox not initialized, nothing to destroy")
             return
 
         try:
-            logger.info(f"Destroying sandbox with ID: {self._sandbox.sandbox_id}")
+            logger.info(f"[{self._session_id}] Destroying sandbox with ID: {self._sandbox.sandbox_id}")
 
-            await self._sandbox.kill()
+            # Run synchronous kill in thread pool
+            await asyncio.to_thread(self._sandbox.kill)
 
             self._sandbox = None
             self._is_initialized = False
 
-            logger.info("Sandbox destroyed successfully")
+            logger.info(f"[{self._session_id}] Sandbox destroyed successfully")
 
         except Exception as e:
-            error_msg = f"Failed to destroy sandbox: {str(e)}"
+            error_msg = f"[{self._session_id}] Failed to destroy sandbox: {str(e)}"
             logger.error(error_msg, exc_info=True)
             raise SandboxError(error_msg) from e
 
     @property
     def is_initialized(self) -> bool:
-        """
-        Check if the sandbox is currently initialized.
-
-        Returns:
-            bool: True if sandbox is initialized and ready to use
-
-        Example:
-            ```python
-            if manager.is_initialized:
-                print("Sandbox is ready")
-            else:
-                print("Sandbox needs initialization")
-            ```
-        """
+        """Check if the sandbox is currently initialized."""
         return self._is_initialized and self._sandbox is not None
 
     @property
     def sandbox_id(self) -> Optional[str]:
-        """
-        Get the current sandbox ID.
-
-        Returns:
-            str or None: Sandbox ID if initialized, None otherwise
-
-        Example:
-            ```python
-            if manager.sandbox_id:
-                print(f"Current sandbox: {manager.sandbox_id}")
-            ```
-        """
+        """Get the current sandbox ID."""
         return self._sandbox.sandbox_id if self._sandbox else None
 
-    async def __aenter__(self):
-        """
-        Async context manager entry.
+    async def keep_alive(self, timeout_seconds: int = 1800) -> bool:
+        """Extend sandbox timeout to keep it alive.
 
-        Example:
-            ```python
-            async with SandboxManager() as manager:
-                await manager.write_file("/home/user/app.py", "...")
-                # Sandbox is automatically destroyed on exit
-            ```
+        Args:
+            timeout_seconds: New timeout in seconds (default: 30 minutes)
+
+        Returns:
+            True if successful, False otherwise
         """
+        if not self._is_initialized or self._sandbox is None:
+            return False
+
+        try:
+            await asyncio.to_thread(self._sandbox.set_timeout, timeout_seconds)
+            logger.debug(f"[{self._session_id}] Sandbox timeout extended to {timeout_seconds}s")
+            return True
+        except Exception as e:
+            logger.warning(f"[{self._session_id}] Failed to extend sandbox timeout: {e}")
+            return False
+
+    async def __aenter__(self):
+        """Async context manager entry."""
         await self.ensure_sandbox()
         return self
 

@@ -7,18 +7,19 @@ API but runs everything on the local filesystem for development and testing.
 
 import asyncio
 import logging
+import os
+import shlex
+import signal
 import socket
 import subprocess
 import shutil
+import tempfile
+import httpx
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+from .logging_config import get_session_logger
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
@@ -70,6 +71,12 @@ class LocalSandboxManager:
         self._project_dir: Optional[Path] = None
         self._allocated_port: Optional[int] = None
         self._dev_server_process: Optional[subprocess.Popen] = None
+        # Track all background processes for cleanup (C1 fix)
+        self._background_processes: List[subprocess.Popen] = []
+
+        # Initialize super-logger
+        self._slogger = get_session_logger(self._session_id)
+        self._slogger.log_sandbox("INIT", f"template={template}, timeout={timeout_seconds}s")
 
         logger.info(
             f"[{self._session_id}] LocalSandboxManager initialized with template='{template}', "
@@ -92,52 +99,88 @@ class LocalSandboxManager:
 
     def _resolve_path(self, project_dir: Path, path: str) -> Path:
         """
-        Resolve a path relative to project directory.
+        Resolve a path relative to project directory with path traversal protection (H7 fix).
 
         Handles:
         - Relative paths: treated as relative to project_dir
         - Absolute paths inside sandbox: used directly
         - Absolute paths outside sandbox: treated as relative
         - macOS /tmp vs /private/tmp symlink differences
+
+        Raises:
+            LocalSandboxFileOperationError: If path traversal is detected
         """
         path_obj = Path(path)
 
         if not path_obj.is_absolute():
-            return project_dir / path
-
-        # Resolve symlinks for comparison (e.g., /tmp -> /private/tmp on macOS)
-        try:
-            resolved_path = path_obj.resolve()
-            resolved_project = project_dir.resolve()
-
-            # Check if path is inside our sandbox (after resolving symlinks)
+            final_path = project_dir / path
+        else:
+            # Resolve symlinks for comparison (e.g., /tmp -> /private/tmp on macOS)
             try:
-                relative = resolved_path.relative_to(resolved_project)
-                # Path is inside sandbox - use it directly
-                return resolved_project / relative
-            except ValueError:
-                pass
+                resolved_path = path_obj.resolve()
+                resolved_project = project_dir.resolve()
 
-            # Also check with /private prefix handling for macOS
-            path_str = str(resolved_path)
-            project_str = str(resolved_project)
-
-            # Handle /private/tmp vs /tmp
-            if path_str.startswith('/private/tmp/') and project_str.startswith('/tmp/'):
-                # Try matching with /private prefix
-                private_project = Path('/private') / project_dir.relative_to('/')
+                # Check if path is inside our sandbox (after resolving symlinks)
                 try:
-                    relative = resolved_path.relative_to(private_project.resolve())
-                    return resolved_project / relative
+                    relative = resolved_path.relative_to(resolved_project)
+                    # Path is inside sandbox - use it directly
+                    final_path = resolved_project / relative
                 except ValueError:
-                    pass
+                    # Also check with /private prefix handling for macOS
+                    path_str = str(resolved_path)
+                    project_str = str(resolved_project)
 
-        except (OSError, RuntimeError):
-            # Path resolution failed, fall back to simple handling
-            pass
+                    # Handle /private/tmp vs /tmp
+                    if path_str.startswith('/private/tmp/') and project_str.startswith('/tmp/'):
+                        # Try matching with /private prefix
+                        private_project = Path('/private') / project_dir.relative_to('/')
+                        try:
+                            relative = resolved_path.relative_to(private_project.resolve())
+                            final_path = resolved_project / relative
+                        except ValueError:
+                            # Path is absolute but outside sandbox - treat as relative
+                            final_path = project_dir / path.lstrip('/')
+                    else:
+                        # Path is absolute but outside sandbox - treat as relative
+                        final_path = project_dir / path.lstrip('/')
 
-        # Path is absolute but outside sandbox - treat as relative
-        return project_dir / path.lstrip('/')
+            except (OSError, RuntimeError):
+                # Path resolution failed, fall back to simple handling
+                final_path = project_dir / path.lstrip('/')
+
+        # Path traversal protection (H7 fix): verify final path is within sandbox
+        try:
+            resolved_final = final_path.resolve()
+            resolved_sandbox = project_dir.resolve()
+
+            # Check both with and without /private prefix for macOS
+            is_inside = False
+            try:
+                resolved_final.relative_to(resolved_sandbox)
+                is_inside = True
+            except ValueError:
+                # Try with /private prefix for macOS
+                if str(resolved_sandbox).startswith('/tmp/'):
+                    private_sandbox = Path('/private') / project_dir.relative_to('/')
+                    try:
+                        resolved_final.relative_to(private_sandbox.resolve())
+                        is_inside = True
+                    except ValueError:
+                        pass
+
+            if not is_inside:
+                logger.error(f"[{self._session_id}] Path traversal attempt blocked: {path} -> {resolved_final}")
+                raise LocalSandboxFileOperationError(
+                    f"Path traversal detected: {path} resolves outside sandbox"
+                )
+
+        except LocalSandboxFileOperationError:
+            raise
+        except Exception as e:
+            logger.warning(f"[{self._session_id}] Could not verify path security: {e}")
+            # Still allow the operation but log a warning
+
+        return final_path
 
     async def ensure_sandbox(self, template: Optional[str] = None) -> Path:
         """Ensure project directory is created and return it (lazy initialization)."""
@@ -145,9 +188,11 @@ class LocalSandboxManager:
             logger.debug(f"[{self._session_id}] Sandbox already initialized, returning existing directory")
             return self._project_dir
 
+        self._slogger.log_sandbox("ENSURE_START", "creating sandbox directory")
+
         try:
-            # Create project directory
-            base_dir = Path("/tmp/app-builder")
+            # Create project directory using cross-platform temp dir (L2 fix)
+            base_dir = Path(tempfile.gettempdir()) / "app-builder"
             base_dir.mkdir(parents=True, exist_ok=True)
 
             self._project_dir = base_dir / self._session_id
@@ -157,6 +202,12 @@ class LocalSandboxManager:
             self._allocated_port = self._find_available_port(start_port=3001)
 
             self._is_initialized = True
+
+            self._slogger.log_sandbox(
+                "ENSURE_DONE",
+                f"dir={self._project_dir}, port={self._allocated_port}"
+            )
+
             logger.info(
                 f"[{self._session_id}] Local sandbox created successfully at: {self._project_dir} "
                 f"(allocated port: {self._allocated_port})"
@@ -171,6 +222,8 @@ class LocalSandboxManager:
 
     async def write_file(self, path: str, content: str) -> Dict[str, Any]:
         """Write content to a file in the local filesystem."""
+        self._slogger.log_sandbox("WRITE_FILE_START", f"path={path}, size={len(content)}")
+
         try:
             project_dir = await self.ensure_sandbox()
 
@@ -192,6 +245,8 @@ class LocalSandboxManager:
                 "size": len(content.encode('utf-8'))
             }
 
+            self._slogger.log_sandbox("WRITE_FILE_DONE", f"path={file_path}, size={result['size']}")
+
             logger.info(f"[{self._session_id}] Successfully wrote {result['size']} bytes to {file_path}")
             return result
 
@@ -204,6 +259,8 @@ class LocalSandboxManager:
 
     async def read_file(self, path: str) -> str:
         """Read content from a file in the local filesystem."""
+        self._slogger.log_sandbox("READ_FILE_START", f"path={path}")
+
         try:
             project_dir = await self.ensure_sandbox()
 
@@ -214,6 +271,8 @@ class LocalSandboxManager:
 
             # Read file
             content = await asyncio.to_thread(file_path.read_text, encoding='utf-8')
+
+            self._slogger.log_sandbox("READ_FILE_DONE", f"path={file_path}, size={len(content)}")
 
             logger.info(f"[{self._session_id}] Successfully read {len(content)} bytes from {file_path}")
             return content
@@ -237,6 +296,9 @@ class LocalSandboxManager:
             timeout: Command timeout in seconds (default 120, use 0 or None for no timeout)
             background: If True, start process in background and return immediately
         """
+        cmd_preview = command[:80] + ('...' if len(command) > 80 else '')
+        self._slogger.log_sandbox("RUN_CMD_START", f"cmd={cmd_preview}, timeout={timeout}s, background={background}")
+
         try:
             project_dir = await self.ensure_sandbox()
             logger.info(
@@ -245,7 +307,8 @@ class LocalSandboxManager:
             )
 
             if background:
-                # Start process in background
+                # Start process in background with new process group (M9 fix)
+                # Using start_new_session=True ensures children are in same group
                 process = await asyncio.to_thread(
                     subprocess.Popen,
                     command,
@@ -253,11 +316,17 @@ class LocalSandboxManager:
                     cwd=str(project_dir),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True
+                    text=True,
+                    start_new_session=True  # Process group for proper cleanup
                 )
+
+                # Track background process for cleanup (C1 fix)
+                self._background_processes.append(process)
 
                 # Give process time to start
                 await asyncio.sleep(2)
+
+                self._slogger.log_sandbox("RUN_CMD_DONE", f"background=true, pid={process.pid}")
 
                 logger.info(f"[{self._session_id}] Background process started with PID: {process.pid}")
                 return {
@@ -302,6 +371,11 @@ class LocalSandboxManager:
                     "success": exit_code == 0
                 }
 
+                self._slogger.log_sandbox(
+                    "RUN_CMD_DONE",
+                    f"exit_code={exit_code}, stdout_len={len(stdout)}, stderr_len={len(stderr)}"
+                )
+
                 if result['success']:
                     logger.info(
                         f"[{self._session_id}] Command executed successfully: {command[:50]}... "
@@ -324,6 +398,57 @@ class LocalSandboxManager:
             logger.error(error_msg, exc_info=True)
             raise LocalSandboxCommandError(error_msg) from e
 
+    async def _kill_dev_server(self) -> None:
+        """Kill existing dev server process if running (H4 fix)."""
+        if self._dev_server_process is not None:
+            try:
+                if self._dev_server_process.poll() is None:
+                    logger.info(f"[{self._session_id}] Killing existing dev server (PID: {self._dev_server_process.pid})")
+                    # Kill entire process group
+                    try:
+                        os.killpg(os.getpgid(self._dev_server_process.pid), signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError):
+                        self._dev_server_process.terminate()
+
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(self._dev_server_process.wait),
+                            timeout=3.0
+                        )
+                    except asyncio.TimeoutError:
+                        try:
+                            os.killpg(os.getpgid(self._dev_server_process.pid), signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            self._dev_server_process.kill()
+                        await asyncio.to_thread(self._dev_server_process.wait)
+            except Exception as e:
+                logger.warning(f"[{self._session_id}] Error killing dev server: {e}")
+            finally:
+                self._dev_server_process = None
+
+    async def _health_check(self, url: str, timeout: float = 30.0, interval: float = 1.0) -> bool:
+        """Check if server is healthy with HTTP probe (H5 fix).
+
+        Args:
+            url: URL to probe
+            timeout: Total timeout in seconds
+            interval: Interval between probes
+
+        Returns:
+            True if server is healthy, False otherwise
+        """
+        start_time = asyncio.get_event_loop().time()
+        async with httpx.AsyncClient() as client:
+            while (asyncio.get_event_loop().time() - start_time) < timeout:
+                try:
+                    response = await client.get(url, timeout=2.0)
+                    if response.status_code < 500:
+                        return True
+                except (httpx.RequestError, httpx.TimeoutException):
+                    pass
+                await asyncio.sleep(interval)
+        return False
+
     async def start_dev_server(self, project_dir: str = ".", port: Optional[int] = None) -> Dict[str, Any]:
         """Start a development server in the background and return preview URL.
 
@@ -334,14 +459,23 @@ class LocalSandboxManager:
         Returns:
             Dict with preview_url and status
         """
+        self._slogger.log_sandbox("DEV_SERVER_START", f"dir={project_dir}, requested_port={port}")
+
         try:
             sandbox_root = await self.ensure_sandbox()
 
-            # Use allocated port if not specified
-            server_port = port or self._allocated_port
-            if not server_port:
-                server_port = self._find_available_port(start_port=3001)
-                self._allocated_port = server_port
+            # Kill existing dev server first (H4 fix)
+            await self._kill_dev_server()
+
+            # ALWAYS use allocated port in local mode - ignore agent's port preference
+            # This prevents conflicts with frontend (port 3000) and other services
+            if not self._allocated_port:
+                self._allocated_port = self._find_available_port(start_port=3001)
+            server_port = self._allocated_port
+
+            # Log if agent requested different port
+            if port and port != server_port:
+                logger.info(f"[{self._session_id}] Ignoring requested port {port}, using allocated port {server_port}")
 
             # Resolve project directory - handle absolute and relative paths
             if project_dir == ".":
@@ -349,7 +483,10 @@ class LocalSandboxManager:
             else:
                 work_dir = self._resolve_path(sandbox_root, project_dir)
 
-            # Start dev server in background
+            # Escape work_dir for shell safety (M6 fix)
+            safe_work_dir = shlex.quote(str(work_dir))
+
+            # Start dev server in background with process group (M9 fix)
             command = f"PORT={server_port} npm run dev"
             logger.info(f"[{self._session_id}] Starting dev server in {work_dir}: {command}")
 
@@ -360,16 +497,19 @@ class LocalSandboxManager:
                 cwd=str(work_dir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                start_new_session=True  # Process group for proper cleanup
             )
 
-            # Wait for server to start
-            logger.info(f"[{self._session_id}] Waiting for dev server to start...")
-            await asyncio.sleep(5)
+            # Health check with HTTP probe (H5 fix)
+            preview_url = f"http://localhost:{server_port}"
+            logger.info(f"[{self._session_id}] Waiting for dev server health check on {preview_url}...")
 
-            # Check if server is running
+            # First wait a bit for process to start
+            await asyncio.sleep(2)
+
+            # Check if process died immediately
             if self._dev_server_process.poll() is not None:
-                # Process died
                 stdout, stderr = self._dev_server_process.communicate()
                 error_msg = f"Dev server failed to start. stderr: {stderr}"
                 logger.error(f"[{self._session_id}] {error_msg}")
@@ -378,8 +518,27 @@ class LocalSandboxManager:
                     "error": error_msg
                 }
 
-            # Get preview URL
-            preview_url = f"http://localhost:{server_port}"
+            # Perform health check
+            if await self._health_check(preview_url, timeout=30.0):
+                logger.info(f"[{self._session_id}] Dev server is healthy at {preview_url}")
+            else:
+                # Server might still be starting, check if process is alive
+                if self._dev_server_process.poll() is not None:
+                    stdout, stderr = self._dev_server_process.communicate()
+                    error_msg = f"Dev server died during startup. stderr: {stderr}"
+                    logger.error(f"[{self._session_id}] {error_msg}")
+                    return {
+                        "success": False,
+                        "error": error_msg
+                    }
+                else:
+                    # Process is running but not responding to HTTP yet - might be slow startup
+                    logger.warning(f"[{self._session_id}] Health check timed out but process is running")
+
+            self._slogger.log_sandbox(
+                "DEV_SERVER_READY",
+                f"url={preview_url}, port={server_port}, pid={self._dev_server_process.pid}"
+            )
 
             logger.info(f"[{self._session_id}] Dev server started, preview URL: {preview_url}")
 
@@ -421,6 +580,8 @@ class LocalSandboxManager:
             # List files
             files = [item.name for item in list_path.iterdir()]
 
+            self._slogger.log_sandbox("LIST_FILES", f"path={path}, count={len(files)}")
+
             logger.info(f"[{self._session_id}] Found {len(files)} items in {list_path}")
             return files
 
@@ -445,6 +606,8 @@ class LocalSandboxManager:
 
             url = f"http://localhost:{server_port}"
 
+            self._slogger.log_sandbox("GET_PREVIEW_URL", f"port={server_port}, url={url}")
+
             logger.info(f"[{self._session_id}] Generated preview URL for port {server_port}: {url}")
             return url
 
@@ -454,6 +617,38 @@ class LocalSandboxManager:
             error_msg = f"[{self._session_id}] Failed to get preview URL for port {port}: {str(e)}"
             logger.error(error_msg, exc_info=True)
             raise LocalSandboxError(error_msg) from e
+
+    async def _kill_process(self, process: subprocess.Popen, name: str = "process") -> None:
+        """Kill a process and its entire process group."""
+        if process is None or process.poll() is not None:
+            return
+
+        try:
+            logger.info(f"[{self._session_id}] Terminating {name} (PID: {process.pid})")
+
+            # Try to kill the entire process group
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                process.terminate()
+
+            # Wait for graceful shutdown
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(process.wait),
+                    timeout=3.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[{self._session_id}] {name} didn't terminate gracefully, killing it")
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    process.kill()
+                await asyncio.to_thread(process.wait)
+
+            logger.info(f"[{self._session_id}] {name} terminated")
+        except Exception as e:
+            logger.warning(f"[{self._session_id}] Error terminating {name}: {e}")
 
     async def destroy(self, delete_files: bool = False) -> None:
         """Cleanup resources and optionally delete project directory.
@@ -465,31 +660,19 @@ class LocalSandboxManager:
             logger.debug(f"[{self._session_id}] Sandbox not initialized, nothing to destroy")
             return
 
+        self._slogger.log_sandbox("DESTROY_START", f"delete_files={delete_files}")
+
         try:
             logger.info(f"[{self._session_id}] Destroying local sandbox")
 
             # Kill dev server process if running
-            if self._dev_server_process is not None:
-                try:
-                    logger.info(f"[{self._session_id}] Terminating dev server process (PID: {self._dev_server_process.pid})")
-                    self._dev_server_process.terminate()
+            await self._kill_process(self._dev_server_process, "dev server")
+            self._dev_server_process = None
 
-                    # Wait for graceful shutdown
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.to_thread(self._dev_server_process.wait),
-                            timeout=5.0
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(f"[{self._session_id}] Process didn't terminate gracefully, killing it")
-                        self._dev_server_process.kill()
-                        await asyncio.to_thread(self._dev_server_process.wait)
-
-                    logger.info(f"[{self._session_id}] Dev server process terminated")
-                except Exception as e:
-                    logger.warning(f"[{self._session_id}] Error terminating dev server: {e}")
-                finally:
-                    self._dev_server_process = None
+            # Kill all tracked background processes (C1 fix)
+            for i, process in enumerate(self._background_processes):
+                await self._kill_process(process, f"background process {i+1}")
+            self._background_processes.clear()
 
             # Optionally delete project directory
             if delete_files and self._project_dir and self._project_dir.exists():
@@ -502,6 +685,8 @@ class LocalSandboxManager:
             self._is_initialized = False
             self._project_dir = None
             self._allocated_port = None
+
+            self._slogger.log_sandbox("DESTROY_DONE", "sandbox destroyed successfully")
 
             logger.info(f"[{self._session_id}] Local sandbox destroyed successfully")
 

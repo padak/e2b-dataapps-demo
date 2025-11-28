@@ -2,12 +2,20 @@ import logging
 import uuid
 from datetime import datetime
 from contextlib import asynccontextmanager
+from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .websocket import ConnectionManager
+
+# Load environment variables from .env file
+# Look for .env in project root (parent of backend/)
+env_path = Path(__file__).parent.parent.parent / ".env"
+load_dotenv(env_path)
+
 
 # Configure logging
 logging.basicConfig(
@@ -91,8 +99,13 @@ async def create_session():
         SessionResponse with new session ID and creation timestamp
     """
     try:
-        session_id = str(uuid.uuid4())
-        created_at = datetime.utcnow().isoformat()
+        # Generate timestamp-prefixed session ID for chronological sorting
+        # Format: YYYYMMDD-HHMMSS-uuid8chars (e.g., 20251128-143052-a1b2c3d4)
+        now = datetime.utcnow()
+        timestamp_prefix = now.strftime("%Y%m%d-%H%M%S")
+        short_uuid = uuid.uuid4().hex[:8]
+        session_id = f"{timestamp_prefix}-{short_uuid}"
+        created_at = now.isoformat()
 
         logger.info(f"Created new session: {session_id}")
 
@@ -167,17 +180,23 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 logger.info(f"WebSocket disconnected normally: {session_id}")
                 break
 
+            except RuntimeError as e:
+                # WebSocket disconnected unexpectedly
+                logger.warning(f"WebSocket runtime error for {session_id}: {e}")
+                break
+
             except Exception as e:
                 logger.error(f"Error in message loop for {session_id}: {e}", exc_info=True)
-                # Try to send error to client
+                # Try to send error to client, then always break (C3 fix)
                 try:
                     await manager.send_message(session_id, {
                         "type": "error",
                         "message": "Internal server error processing message"
                     })
-                except:
-                    # Connection is likely broken
-                    break
+                except Exception:
+                    logger.warning(f"Failed to send error to {session_id}")
+                # Always break after error to prevent resource waste
+                break
 
     except Exception as e:
         logger.error(f"Error in WebSocket endpoint for {session_id}: {e}", exc_info=True)
