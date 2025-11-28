@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { Copy, Check, Code2 } from 'lucide-react';
 import FileTree, { FileNode } from './FileTree';
 
@@ -6,6 +6,36 @@ export interface CodeFile {
   path: string;
   content: string;
   language?: string;
+}
+
+/**
+ * Extract relative path from absolute sandbox path.
+ * Handles paths like /private/var/folders/.../app-builder/session-id/app/page.tsx
+ * Returns just the project-relative part like app/page.tsx
+ */
+function getRelativePath(absolutePath: string): string {
+  // Look for common project root indicators
+  const projectRoots = ['app/', 'components/', 'lib/', 'types/', 'pages/', 'src/', 'public/'];
+
+  for (const root of projectRoots) {
+    const idx = absolutePath.indexOf(root);
+    if (idx !== -1) {
+      return absolutePath.slice(idx);
+    }
+  }
+
+  // Fallback: look for app-builder session pattern and take everything after it
+  const appBuilderMatch = absolutePath.match(/app-builder\/[^/]+\/(.+)$/);
+  if (appBuilderMatch) {
+    return appBuilderMatch[1];
+  }
+
+  // Last resort: just take the filename or last path segments
+  const parts = absolutePath.split('/').filter(Boolean);
+  if (parts.length <= 3) {
+    return parts.join('/');
+  }
+  return parts.slice(-3).join('/');
 }
 
 interface CodeViewProps {
@@ -50,12 +80,18 @@ function highlightPython(code: string): string {
   return highlighted;
 }
 
-function convertFilesToTree(files: CodeFile[]): FileNode[] {
+function convertFilesToTree(files: CodeFile[]): { tree: FileNode[], pathMap: Map<string, string> } {
   const tree: FileNode[] = [];
   const folderMap = new Map<string, FileNode>();
+  // Map from relative path to original absolute path
+  const pathMap = new Map<string, string>();
 
   files.forEach(file => {
-    const parts = file.path.split('/').filter(Boolean);
+    // Convert to relative path for display
+    const relativePath = getRelativePath(file.path);
+    pathMap.set(relativePath, file.path);
+
+    const parts = relativePath.split('/').filter(Boolean);
     let currentPath = '';
     let currentLevel = tree;
 
@@ -66,7 +102,7 @@ function convertFilesToTree(files: CodeFile[]): FileNode[] {
       if (isFile) {
         currentLevel.push({
           name: part,
-          path: file.path,
+          path: relativePath, // Use relative path for display
           type: 'file',
         });
       } else {
@@ -86,15 +122,22 @@ function convertFilesToTree(files: CodeFile[]): FileNode[] {
     });
   });
 
-  return tree;
+  return { tree, pathMap };
 }
 
 export default function CodeView({ files }: CodeViewProps) {
-  const [selectedFile, setSelectedFile] = useState<string>(files[0]?.path || '');
+  // Convert files to tree structure with relative paths
+  const { tree: fileTree, pathMap } = useMemo(() => convertFilesToTree(files), [files]);
+
+  // Get initial selected file (first file's relative path)
+  const firstRelativePath = files.length > 0 ? getRelativePath(files[0].path) : '';
+  const [selectedFile, setSelectedFile] = useState<string>(firstRelativePath);
   const [copiedFile, setCopiedFile] = useState<string | null>(null);
 
-  const fileTree = convertFilesToTree(files);
-  const currentFile = files.find(f => f.path === selectedFile);
+  // Find current file by looking up the absolute path from the relative path
+  const absolutePath = pathMap.get(selectedFile);
+  const currentFile = files.find(f => f.path === absolutePath);
+  const displayPath = selectedFile; // This is already the relative path
 
   const handleCopy = async (content: string, filePath: string) => {
     try {
@@ -121,8 +164,8 @@ export default function CodeView({ files }: CodeViewProps) {
 
   return (
     <div className="h-full flex">
-      {/* File tree sidebar */}
-      <div className="w-64 border-r border-[var(--color-border)] bg-[var(--color-surface)]">
+      {/* File tree sidebar - scrollable */}
+      <div className="w-56 min-w-[14rem] border-r border-[var(--color-border)] bg-[var(--color-surface)] overflow-hidden flex flex-col">
         <FileTree
           files={fileTree}
           selectedFile={selectedFile}
@@ -131,15 +174,15 @@ export default function CodeView({ files }: CodeViewProps) {
       </div>
 
       {/* Code content */}
-      <div className="flex-1 flex flex-col overflow-hidden">
+      <div className="flex-1 flex flex-col overflow-hidden min-w-0">
         {currentFile ? (
           <>
             {/* File header */}
             <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--color-border)] bg-[var(--color-bg)]/50">
-              <div className="flex items-center gap-2">
-                <Code2 className="w-4 h-4 text-accent-cyan" />
-                <span className="font-mono text-sm text-[var(--color-text)]">
-                  {currentFile.path}
+              <div className="flex items-center gap-2 min-w-0 flex-1">
+                <Code2 className="w-4 h-4 text-accent-cyan shrink-0" />
+                <span className="font-mono text-sm text-[var(--color-text)] truncate" title={currentFile.path}>
+                  {displayPath}
                 </span>
               </div>
 
