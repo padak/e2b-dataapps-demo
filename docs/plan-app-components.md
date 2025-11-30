@@ -470,8 +470,103 @@ snowflake-sqlalchemy
 # Keboola MCP se spouští přes uvx (keboola_mcp_server)
 ```
 
+## Fáze 0: Setup & Explorace (PRE-DEVEL)
+
+Praktická příprava před hlavní implementací - ověření že všechno funguje.
+
+### 0.1 Ověření Keboola připojení
+
+**Cíl:** Ověřit že existující credentials v `.env` fungují.
+
+```bash
+# Máme v .env:
+KBC_URL=https://connection.keboola.com/
+KBC_TOKEN=xxx
+WORKSPACE_ID=xxx
+BRANCH_ID=xxx
+```
+
+**Test script:** `scripts/test_keboola_connection.py`
+- Otestuje Query Service API (jako example1.py)
+- Vypíše dostupné tabulky
+- Vrátí sample dat
+
+### 0.2 Vyzkoušení Keboola MCP
+
+**Cíl:** Rozběhnout Keboola MCP server a otestovat jeho tools.
+
+```bash
+# Instalace
+pip install keboola-mcp-server
+
+# Spuštění (stdio mode)
+uvx keboola_mcp_server --transport stdio
+```
+
+**MCP Environment:**
+```bash
+export KBC_STORAGE_API_URL=https://connection.keboola.com
+export KBC_STORAGE_TOKEN=xxx  # Master token nebo storage token
+```
+
+**Test tools:**
+- `get_project_info` - info o projektu
+- `list_buckets` - seznam bucketů
+- `list_tables` - tabulky v bucketu
+- `get_table` - schéma tabulky
+- `query_data` - SQL query
+
+**Výstup:** `scripts/explore_keboola_mcp.py` - skript pro interaktivní exploraci
+
+### 0.3 První UI komponenta: DataTable
+
+**Cíl:** Vytvořit odladěnou DataTable komponentu a malou testovací Next.js app.
+
+**Postup:**
+1. Vytvořit minimální Next.js app v `sandbox-template/`
+2. Přidat Snowflake connector
+3. Implementovat DataTable komponentu
+4. Otestovat na reálných datech z Keboola workspace
+
+**Výstup:**
+```
+components/curated/data-table/
+├── DataTable.tsx       # Odladěná komponenta
+├── usage.md            # Dokumentace pro agenta
+└── example.tsx         # Příklad použití
+```
+
+### 0.4 Získání Snowflake credentials z workspace
+
+**Cíl:** Pochopit jak získat Snowflake credentials pro přímé SQL dotazy.
+
+Keboola workspace poskytuje Snowflake credentials:
+- Account, User, Password
+- Database, Schema
+- Warehouse
+
+**Test:** Script který získá credentials a provede přímý Snowflake dotaz.
+
+### Checklist Fáze 0
+
+- [ ] Query Service API funguje (existující .env)
+- [ ] Keboola MCP server běží a odpovídá
+- [ ] MCP tools fungují (list_buckets, list_tables, query_data)
+- [ ] Máme Snowflake credentials z workspace
+- [ ] DataTable komponenta je hotová a otestovaná
+- [ ] Testovací Next.js app se připojí na data
+
+---
+
 ## Pořadí implementace
 
+**Fáze 0: Setup & Explorace** ← NOVÁ (teď)
+0. Ověření Keboola připojení
+1. Vyzkoušení Keboola MCP
+2. První UI komponenta (DataTable)
+3. Snowflake credentials workflow
+
+**Fáze 1-6: Hlavní implementace** (po Fázi 0)
 1. **Domain Knowledge Prompt** - základní inteligence agenta
 2. **Curated Component Library** - konzistentní UI
 3. **Keboola MCP Integration** - připojení k datům
@@ -479,4 +574,4 @@ snowflake-sqlalchemy
 5. **Security Reviewer** - bezpečnostní kontrola
 6. **Interactive Planning** - lepší dialog s uživatelem
 
-Fáze 1-2 jsou základ, 3-4 přidají data, 5-6 vylepší bezpečnost a UX.
+Fáze 0 je praktická příprava, Fáze 1-2 jsou základ, 3-4 přidají data, 5-6 vylepší bezpečnost a UX.

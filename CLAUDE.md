@@ -7,8 +7,11 @@ AI-powered application builder using Claude Agent SDK. Users describe apps in na
 ```
 backend/app/          # FastAPI + Claude Agent SDK
 frontend/src/         # React + Zustand + WebSocket
+components/curated/   # Pre-built UI components for generated apps
+scripts/              # Utility scripts (Keboola testing, etc.)
 docs/                 # Architecture documentation
 tests/                # Test files
+e2b-integration/      # E2B sandbox templates (parked)
 ```
 
 ## Key Files
