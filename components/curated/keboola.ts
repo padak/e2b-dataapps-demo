@@ -1,5 +1,6 @@
 /**
  * Keboola Query Service client for Next.js apps.
+ * Uses official @keboola/query-service SDK.
  *
  * Environment variables required:
  * - KBC_URL: Keboola connection URL (e.g., https://connection.keboola.com/)
@@ -8,11 +9,44 @@
  * - BRANCH_ID: Branch ID
  */
 
-interface QueryResult {
-  columns: { name: string }[]
-  data: unknown[][]
-  status: string
-  message?: string
+import { Client, JobError } from "@keboola/query-service"
+
+// Lazy-initialized client singleton
+let _client: Client | null = null
+
+function getClient(): Client {
+  if (!_client) {
+    const kbcUrl = process.env.KBC_URL
+    const token = process.env.KBC_TOKEN
+
+    if (!kbcUrl || !token) {
+      throw new Error(
+        "Missing Keboola environment variables. Required: KBC_URL, KBC_TOKEN"
+      )
+    }
+
+    // Convert connection URL to query service URL
+    const baseUrl = kbcUrl.replace("connection.", "query.").replace(/\/$/, "")
+
+    _client = new Client({
+      baseUrl,
+      token,
+    })
+  }
+  return _client
+}
+
+function getWorkspaceConfig() {
+  const workspaceId = process.env.WORKSPACE_ID
+  const branchId = process.env.BRANCH_ID
+
+  if (!workspaceId || !branchId) {
+    throw new Error(
+      "Missing Keboola environment variables. Required: WORKSPACE_ID, BRANCH_ID"
+    )
+  }
+
+  return { workspaceId, branchId }
 }
 
 /**
@@ -21,114 +55,36 @@ interface QueryResult {
 export async function queryData<T extends Record<string, unknown>>(
   query: string
 ): Promise<T[]> {
-  const kbcUrl = process.env.KBC_URL
-  const token = process.env.KBC_TOKEN
-  const workspaceId = process.env.WORKSPACE_ID
-  const branchId = process.env.BRANCH_ID
+  const client = getClient()
+  const { branchId, workspaceId } = getWorkspaceConfig()
 
-  if (!kbcUrl || !token || !workspaceId || !branchId) {
-    throw new Error(
-      "Missing Keboola environment variables. Required: KBC_URL, KBC_TOKEN, WORKSPACE_ID, BRANCH_ID"
-    )
-  }
+  try {
+    const results = await client.executeQuery({
+      branchId,
+      workspaceId,
+      statements: [query],
+    })
 
-  const queryServiceUrl =
-    kbcUrl.replace("connection.", "query.").replace(/\/$/, "") + "/api/v1"
-
-  const headers = {
-    "X-StorageAPI-Token": token,
-    Accept: "application/json",
-    "Content-Type": "application/json",
-  }
-
-  // Submit query
-  const submitResponse = await fetch(
-    `${queryServiceUrl}/branches/${branchId}/workspaces/${workspaceId}/queries`,
-    {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ statements: [query] }),
-    }
-  )
-
-  if (!submitResponse.ok) {
-    const error = await submitResponse.text()
-    throw new Error(`Query submission failed: ${error}`)
-  }
-
-  const submission = await submitResponse.json()
-  const jobId = submission.queryJobId
-
-  if (!jobId) {
-    throw new Error("Query Service did not return a job identifier")
-  }
-
-  // Poll for completion
-  const startTime = Date.now()
-  const timeout = 60000 // 60 seconds
-
-  while (true) {
-    const statusResponse = await fetch(
-      `${queryServiceUrl}/queries/${jobId}`,
-      { headers }
-    )
-
-    if (!statusResponse.ok) {
-      throw new Error(`Failed to check query status: ${statusResponse.statusText}`)
+    if (!results.length) {
+      return []
     }
 
-    const jobInfo = await statusResponse.json()
-    const status = jobInfo.status
+    const result = results[0]
 
-    if (status === "completed" || status === "failed" || status === "canceled") {
-      if (status !== "completed") {
-        throw new Error(`Query ${status}: ${jobInfo.message || "Unknown error"}`)
-      }
-
-      // Get results
-      const statements = jobInfo.statements || []
-      if (!statements.length) {
-        return []
-      }
-
-      const statementId = statements[0].id
-      const resultsResponse = await fetch(
-        `${queryServiceUrl}/queries/${jobId}/${statementId}/results`,
-        { headers }
-      )
-
-      if (!resultsResponse.ok) {
-        throw new Error(`Failed to fetch results: ${resultsResponse.statusText}`)
-      }
-
-      const results: QueryResult = await resultsResponse.json()
-      console.log("[keboola] Results response:", JSON.stringify(results).slice(0, 500))
-
-      // Status might be "completed" or "COMPLETED" or similar
-      const resultStatus = results.status?.toLowerCase()
-      if (resultStatus !== "completed") {
-        throw new Error(
-          `Query failed: ${results.message || results.status || JSON.stringify(results).slice(0, 200)}`
-        )
-      }
-
-      // Transform to array of objects
-      const columns = results.columns.map((col) => col.name)
-      return results.data.map((row) => {
-        const obj: Record<string, unknown> = {}
-        columns.forEach((col, i) => {
-          obj[col] = row[i]
-        })
-        return obj as T
+    // Transform to array of objects
+    const columns = result.columns.map((col) => col.name)
+    return result.data.map((row) => {
+      const obj: Record<string, unknown> = {}
+      columns.forEach((col, i) => {
+        obj[col] = row[i]
       })
+      return obj as T
+    })
+  } catch (error) {
+    if (error instanceof JobError) {
+      throw new Error(`Query failed: ${error.message}`)
     }
-
-    if (Date.now() - startTime > timeout) {
-      throw new Error("Query timed out after 60 seconds")
-    }
-
-    // Wait before polling again
-    await new Promise((resolve) => setTimeout(resolve, 1000))
+    throw error
   }
 }
 
@@ -153,3 +109,7 @@ export async function listTables(schema: string): Promise<string[]> {
     .map((r) => String(r.name ?? r.NAME ?? r.TABLE_NAME ?? ""))
     .filter(Boolean)
 }
+
+// Re-export SDK types and errors for convenience
+export { Client, JobError } from "@keboola/query-service"
+export type { QueryResult, Column, JobStatus } from "@keboola/query-service"

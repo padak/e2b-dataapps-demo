@@ -8,6 +8,7 @@
     "start": "dotenv -e ../../.env -- next start"
   },
   "dependencies": {
+    "@keboola/query-service": "^0.1.4",
     "@radix-ui/react-dropdown-menu": "^2.1.16",
     "@radix-ui/react-slot": "^1.2.4",
     "@tanstack/react-table": "^8.17",

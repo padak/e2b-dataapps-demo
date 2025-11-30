@@ -117,17 +117,76 @@ Pro **exploraci dat** (design fáze):
 - `search` - hledání tabulek/bucketů
 
 Pro **generovanou app** (runtime):
-- App používá **přímý Snowflake SQL** (ne MCP)
-- Credentials z workspace předáme jako env vars
+- App používá **Keboola Query Service API** (ne přímý Snowflake, ne MCP)
+- Credentials předáme jako env vars (KBC_URL, KBC_TOKEN, WORKSPACE_ID, BRANCH_ID)
 
 ### Workflow
 
 1. Agent používá Keboola MCP pro exploraci
 2. Agent pochopí strukturu dat
-3. Agent vygeneruje Next.js app s Snowflake queries
+3. Agent vygeneruje Next.js app s Query Service API voláními
 4. Security reviewer zkontroluje kód
-5. App dostane Snowflake credentials jako env vars
+5. App dostane Keboola credentials jako env vars
 6. App běží nezávisle (žádné MCP, žádné AI)
+
+## Keboola Query Service API
+
+### Python SDK
+
+Pro backend (Python) je k dispozici oficiální SDK:
+
+```bash
+pip install keboola-query-service
+```
+
+**PyPI:** https://pypi.org/project/keboola-query-service/
+
+**Použití:**
+```python
+from keboola_query_service import Client
+
+with Client(
+    base_url="https://query.keboola.com",
+    token="your-storage-api-token"
+) as client:
+    results = client.execute_query(
+        branch_id="123",
+        workspace_id="456",
+        statements=["SELECT * FROM table LIMIT 10"]
+    )
+    for result in results:
+        print(result.data)
+```
+
+Pro nápovědu: `from keboola_query_service import Client; help(Client)`
+
+### TypeScript/Next.js SDK
+
+Pro frontend (Next.js API routes) je k dispozici oficiální SDK:
+
+```bash
+npm install @keboola/query-service
+```
+
+**npm:** https://www.npmjs.com/package/@keboola/query-service
+
+**Použití:**
+```typescript
+import { Client } from '@keboola/query-service';
+
+const client = new Client({
+  baseUrl: 'https://query.keboola.com',
+  token: 'your-storage-api-token'
+});
+
+const results = await client.executeQuery({
+  branchId: '123',
+  workspaceId: '456',
+  statements: ['SELECT * FROM table LIMIT 10']
+});
+```
+
+**Curated wrapper:** `components/curated/keboola.ts` - zjednodušený wrapper nad SDK s funkcemi `queryData()`, `listSchemas()`, `listTables()`
 
 ## Credentials Management
 
@@ -135,11 +194,10 @@ Pro **generovanou app** (runtime):
 
 ```bash
 # Před spuštěním Next.js app
-export SNOWFLAKE_ACCOUNT=xxx
-export SNOWFLAKE_USER=xxx
-export SNOWFLAKE_PASSWORD=xxx
-export SNOWFLAKE_DATABASE=xxx
-export SNOWFLAKE_SCHEMA=xxx
+export KBC_URL=https://connection.keboola.com/
+export KBC_TOKEN=your-storage-api-token
+export WORKSPACE_ID=123456
+export BRANCH_ID=789
 
 cd /tmp/app-builder/session_123
 npm run dev
@@ -149,26 +207,18 @@ npm run dev
 
 ```python
 # Pomocí E2B skills
-sandbox.set_env("SNOWFLAKE_ACCOUNT", credentials.account)
-sandbox.set_env("SNOWFLAKE_USER", credentials.user)
-sandbox.set_env("SNOWFLAKE_PASSWORD", credentials.password)
-sandbox.set_env("SNOWFLAKE_DATABASE", credentials.database)
-sandbox.set_env("SNOWFLAKE_SCHEMA", credentials.schema)
+sandbox.set_env("KBC_URL", "https://connection.keboola.com/")
+sandbox.set_env("KBC_TOKEN", credentials.token)
+sandbox.set_env("WORKSPACE_ID", credentials.workspace_id)
+sandbox.set_env("BRANCH_ID", credentials.branch_id)
 ```
 
 ### V generované aplikaci
 
 ```typescript
-// lib/db.ts
-import snowflake from 'snowflake-sdk';
-
-const connection = snowflake.createConnection({
-  account: process.env.SNOWFLAKE_ACCOUNT!,
-  username: process.env.SNOWFLAKE_USER!,
-  password: process.env.SNOWFLAKE_PASSWORD!,
-  database: process.env.SNOWFLAKE_DATABASE!,
-  schema: process.env.SNOWFLAKE_SCHEMA!,
-});
+// lib/keboola.ts (z curated komponent)
+// Query Service URL se odvozuje z KBC_URL (connection. -> query.)
+// Viz components/curated/keboola.ts pro kompletní implementaci
 ```
 
 ## Security
@@ -512,16 +562,17 @@ Agent defaultně preferuje curated jako základ, ale respektuje explicitní pož
 - `KEBOOLA_MCP_KNOWLEDGE` - MCP tools for data exploration
 - Integrováno do `agent.py` via import
 
-### Fáze 2: Curated Component Library
+### Fáze 2: Curated Component Library 🔶 IN PROGRESS
 
 **Soubory:**
 - `components/curated/` - knihovna komponent
 
 **Úkoly:**
-1. Vytvořit základní komponenty (DataTable, LineChart, DataPreview)
-2. Napsat usage.md pro každou
-3. Registr komponent v system promptu
-4. Automatická injekce do sandboxu
+1. ✅ Vytvořit základní komponenty (DataTable, KeboolaStoragePicker)
+2. ✅ `keboola.ts` používá Query Service API (ne přímý Snowflake)
+3. ⏳ Napsat usage.md pro komponenty
+4. ⏳ Aktualizovat registr komponent (`components.json`)
+5. ~~Automatická injekce do sandboxu~~ → N/A (lokální mode, agent kopíruje sám)
 
 ### Fáze 3: Keboola MCP Integration
 
@@ -607,11 +658,12 @@ Věci které teď neřešíme, ale budeme potřebovat:
 ## Závislosti
 
 ```
-# Nové Python packages
-snowflake-connector-python
-snowflake-sqlalchemy
+# Python packages (viz requirements.txt)
+keboola-query-service>=0.1.1    # Keboola Query Service SDK
 # Keboola MCP se spouští přes uvx (keboola_mcp_server)
 ```
+
+**Poznámka:** Nepotřebujeme přímé Snowflake připojení - vše jde přes Keboola Query Service API.
 
 ## Fáze 0: Setup & Explorace (PRE-DEVEL)
 
