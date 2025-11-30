@@ -183,6 +183,102 @@ class LocalSandboxManager:
 
         return final_path
 
+    async def _copy_curated_components(self) -> None:
+        """
+        Copy all curated components to sandbox.
+
+        This ensures the sandbox has access to:
+        - lib/keboola.ts - Keboola Query Service client
+        - lib/utils.ts - Utility functions (cn, etc.)
+        - components/ui/* - shadcn/ui primitives
+        - components/data-table/* - DataTable components
+        - app/api/keboola/route.ts - API route for Keboola
+        - curated-registry.json - Component metadata for agent reference
+        """
+        if not self._project_dir:
+            logger.warning(f"[{self._session_id}] Cannot copy curated components: project_dir not set")
+            return
+
+        try:
+            # Determine project root (backend/app -> project root)
+            backend_app_dir = Path(__file__).parent
+            project_root = backend_app_dir.parent.parent
+            curated_dir = project_root / "components" / "curated"
+
+            if not curated_dir.exists():
+                logger.warning(
+                    f"[{self._session_id}] Curated components directory not found at {curated_dir}"
+                )
+                return
+
+            copied_count = 0
+
+            # 1. Copy lib/keboola.ts
+            keboola_src = curated_dir / "keboola.ts"
+            if keboola_src.exists():
+                lib_dir = self._project_dir / "lib"
+                lib_dir.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(shutil.copy2, keboola_src, lib_dir / "keboola.ts")
+                copied_count += 1
+
+            # 2. Copy lib/utils.ts
+            utils_src = curated_dir / "lib" / "utils.ts"
+            if utils_src.exists():
+                lib_dir = self._project_dir / "lib"
+                lib_dir.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(shutil.copy2, utils_src, lib_dir / "utils.ts")
+                copied_count += 1
+
+            # 3. Copy components/ui/* (shadcn primitives)
+            ui_src_dir = curated_dir / "components" / "ui"
+            if ui_src_dir.exists():
+                ui_dest_dir = self._project_dir / "components" / "ui"
+                ui_dest_dir.mkdir(parents=True, exist_ok=True)
+                for ui_file in ui_src_dir.glob("*.tsx"):
+                    await asyncio.to_thread(shutil.copy2, ui_file, ui_dest_dir / ui_file.name)
+                    copied_count += 1
+
+            # 4. Copy data-table components
+            dt_src_dir = curated_dir / "data-table"
+            if dt_src_dir.exists():
+                dt_dest_dir = self._project_dir / "components" / "data-table"
+                dt_dest_dir.mkdir(parents=True, exist_ok=True)
+                for dt_file in dt_src_dir.glob("*.tsx"):
+                    await asyncio.to_thread(shutil.copy2, dt_file, dt_dest_dir / dt_file.name)
+                    copied_count += 1
+                # Also copy index.ts if exists
+                dt_index = dt_src_dir / "index.ts"
+                if dt_index.exists():
+                    await asyncio.to_thread(shutil.copy2, dt_index, dt_dest_dir / "index.ts")
+                    copied_count += 1
+
+            # 5. Copy API route for Keboola
+            api_src = curated_dir / "app" / "api" / "keboola" / "route.ts"
+            if api_src.exists():
+                api_dest_dir = self._project_dir / "app" / "api" / "keboola"
+                api_dest_dir.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(shutil.copy2, api_src, api_dest_dir / "route.ts")
+                copied_count += 1
+
+            # 6. Copy registry.json as curated-registry.json for agent reference
+            registry_src = curated_dir / "registry.json"
+            if registry_src.exists():
+                await asyncio.to_thread(
+                    shutil.copy2, registry_src, self._project_dir / "curated-registry.json"
+                )
+                copied_count += 1
+
+            logger.info(
+                f"[{self._session_id}] Copied {copied_count} curated component files to sandbox"
+            )
+            self._slogger.log_sandbox("COPY_CURATED", f"files={copied_count}")
+
+        except Exception as e:
+            # Don't fail sandbox initialization if copy fails
+            logger.warning(
+                f"[{self._session_id}] Failed to copy curated components: {e}"
+            )
+
     async def ensure_sandbox(self, template: Optional[str] = None) -> Path:
         """Ensure project directory is created and return it (lazy initialization)."""
         if self._is_initialized and self._project_dir is not None:
@@ -201,6 +297,9 @@ class LocalSandboxManager:
 
             # Allocate a port
             self._allocated_port = self._find_available_port(start_port=3001)
+
+            # Copy all curated components to sandbox
+            await self._copy_curated_components()
 
             self._is_initialized = True
 
@@ -754,9 +853,11 @@ class LocalSandboxManager:
 
     @property
     def preview_url(self) -> Optional[str]:
-        """Get the current preview URL if port is allocated."""
-        if self._allocated_port:
-            return f"http://localhost:{self._allocated_port}"
+        """Get the current preview URL only if dev server is actually running."""
+        if self._dev_server_process is not None and self._dev_server_process.poll() is None:
+            # Dev server process exists and is still running
+            if self._allocated_port:
+                return f"http://localhost:{self._allocated_port}"
         return None
 
     async def __aenter__(self):

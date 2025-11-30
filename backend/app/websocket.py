@@ -9,8 +9,13 @@ from .logging_config import get_session_logger, close_session_logger
 
 logger = logging.getLogger(__name__)
 
-# Default timeout for agent responses (5 minutes)
-AGENT_RESPONSE_TIMEOUT = 300
+# Default timeout for agent responses (10 minutes)
+# Security reviewer + complex apps can take longer
+AGENT_RESPONSE_TIMEOUT = 600
+
+# Grace period before destroying agent after disconnect (60 seconds)
+# Allows page reloads and short disconnects without losing session
+AGENT_CLEANUP_GRACE_PERIOD = 60
 
 
 class ConnectionManager:
@@ -23,83 +28,164 @@ class ConnectionManager:
         self._connection_lock = asyncio.Lock()
         self._send_locks: Dict[str, asyncio.Lock] = {}  # Per-session send locks (M1 fix)
         self._chat_in_progress: Dict[str, bool] = {}  # Track active chats (H2 fix)
+        # Pending cleanup tasks for graceful agent destruction
+        self._pending_cleanups: Dict[str, asyncio.Task] = {}
         logger.info("ConnectionManager initialized")
 
-    async def connect(self, websocket: WebSocket, session_id: str):
+    async def connect(self, websocket: WebSocket, session_id: str, reconnect: bool = False):
         """
-        Accept a WebSocket connection and create an associated agent.
+        Accept a WebSocket connection and create or reuse an associated agent.
 
         Args:
             websocket: The WebSocket connection to accept
             session_id: Unique identifier for this session
+            reconnect: If True, try to reuse existing agent instead of creating new one
         """
         try:
             # Get session logger and log connection start
             session_logger = get_session_logger(session_id)
-            session_logger.log_session("WS_CONNECT", "client connecting")
+            session_logger.log_session("WS_CONNECT", f"client connecting (reconnect={reconnect})")
 
-            # Initialize agent BEFORE accepting WebSocket (H3 fix)
-            # This ensures we can report init errors properly
-            agent = AppBuilderAgent(session_id=session_id)
-            await agent.initialize()
+            # Cancel any pending cleanup for this session
+            if session_id in self._pending_cleanups:
+                cleanup_task = self._pending_cleanups[session_id]
+                if not cleanup_task.done():
+                    cleanup_task.cancel()
+                    logger.info(f"[{session_id}] Cancelled pending cleanup - client reconnecting")
+                del self._pending_cleanups[session_id]
+
+            # Check if we can reconnect to existing agent
+            existing_agent = self.agents.get(session_id)
+            is_reconnecting = reconnect and existing_agent is not None
+
+            if is_reconnecting:
+                agent = existing_agent
+                logger.info(f"[{session_id}] Reconnecting to existing agent")
+            else:
+                # Initialize new agent BEFORE accepting WebSocket (H3 fix)
+                agent = AppBuilderAgent(session_id=session_id)
+                await agent.initialize()
 
             # Now accept the connection
             await websocket.accept()
 
             async with self._connection_lock:
+                # Close existing websocket if any (but keep the agent)
+                if session_id in self.active_connections:
+                    try:
+                        old_ws = self.active_connections[session_id]
+                        await old_ws.close()
+                    except Exception:
+                        pass  # Old connection might already be dead
+
                 self.active_connections[session_id] = websocket
                 self.agents[session_id] = agent
-                self._send_locks[session_id] = asyncio.Lock()
-                self._chat_in_progress[session_id] = False
+                if session_id not in self._send_locks:
+                    self._send_locks[session_id] = asyncio.Lock()
+                if session_id not in self._chat_in_progress:
+                    self._chat_in_progress[session_id] = False
 
-            logger.info(f"[{session_id}] Client connected")
-            session_logger.log_session("WS_CONNECTED", "client connected")
+            logger.info(f"[{session_id}] Client {'reconnected' if is_reconnecting else 'connected'}")
+            session_logger.log_session("WS_CONNECTED", f"client {'reconnected' if is_reconnecting else 'connected'}")
 
-            # Send welcome message
+            # Send welcome message with reconnect status
             await self.send_message(session_id, {
                 "type": "connection",
                 "status": "connected",
                 "session_id": session_id,
-                "message": "Connected to app builder"
+                "reconnected": is_reconnecting,
+                "message": "Reconnected to existing session" if is_reconnecting else "Connected to app builder"
             })
 
         except Exception as e:
             logger.error(f"[{session_id}] Error connecting client: {e}", exc_info=True)
             raise
 
-    async def disconnect(self, session_id: str):
+    async def disconnect(self, session_id: str, keep_agent: bool = False):
         """
-        Clean up connection and agent resources.
+        Clean up connection and optionally schedule agent cleanup with grace period.
 
         Args:
             session_id: Session identifier to disconnect
+            keep_agent: If True, schedules agent cleanup after grace period instead of immediate cleanup
         """
         try:
             async with self._connection_lock:
-                # Clean up agent
-                if session_id in self.agents:
-                    agent = self.agents[session_id]
-                    try:
-                        await agent.cleanup()
-                    except Exception as cleanup_error:
-                        logger.warning(f"[{session_id}] Error during agent cleanup: {cleanup_error}")
-                    del self.agents[session_id]
-                    logger.info(f"[{session_id}] Agent cleaned up")
-
                 # Remove connection
                 if session_id in self.active_connections:
                     del self.active_connections[session_id]
-                    logger.info(f"[{session_id}] Client disconnected")
+                    logger.info(f"[{session_id}] Client disconnected (agent_kept={keep_agent})")
 
-                # Clean up session-specific resources
-                self._send_locks.pop(session_id, None)
-                self._chat_in_progress.pop(session_id, None)
-
-                # Close session logger
-                close_session_logger(session_id)
+                if keep_agent:
+                    # Schedule cleanup after grace period
+                    if session_id not in self._pending_cleanups:
+                        cleanup_task = asyncio.create_task(
+                            self._delayed_cleanup(session_id, AGENT_CLEANUP_GRACE_PERIOD)
+                        )
+                        self._pending_cleanups[session_id] = cleanup_task
+                        logger.info(f"[{session_id}] Scheduled agent cleanup in {AGENT_CLEANUP_GRACE_PERIOD}s")
+                    else:
+                        logger.debug(f"[{session_id}] Cleanup already scheduled")
+                else:
+                    # Immediate cleanup
+                    await self._cleanup_agent(session_id)
 
         except Exception as e:
             logger.error(f"[{session_id}] Error disconnecting client: {e}", exc_info=True)
+
+    async def _delayed_cleanup(self, session_id: str, delay: int):
+        """
+        Wait for grace period, then cleanup agent if client hasn't reconnected.
+
+        Args:
+            session_id: Session to cleanup
+            delay: Delay in seconds before cleanup
+        """
+        try:
+            logger.info(f"[{session_id}] Grace period started ({delay}s)")
+            await asyncio.sleep(delay)
+
+            # Check if client reconnected during grace period
+            if session_id in self.active_connections:
+                logger.info(f"[{session_id}] Client reconnected during grace period - cleanup cancelled")
+                return
+
+            logger.info(f"[{session_id}] Grace period expired - cleaning up agent")
+            await self._cleanup_agent(session_id)
+
+            # Remove from pending cleanups
+            async with self._connection_lock:
+                self._pending_cleanups.pop(session_id, None)
+
+        except asyncio.CancelledError:
+            logger.info(f"[{session_id}] Cleanup cancelled - client reconnected")
+        except Exception as e:
+            logger.error(f"[{session_id}] Error in delayed cleanup: {e}", exc_info=True)
+
+    async def _cleanup_agent(self, session_id: str):
+        """
+        Perform actual agent cleanup.
+
+        Args:
+            session_id: Session to cleanup
+        """
+        async with self._connection_lock:
+            # Clean up agent
+            if session_id in self.agents:
+                agent = self.agents[session_id]
+                try:
+                    await agent.cleanup()
+                except Exception as cleanup_error:
+                    logger.warning(f"[{session_id}] Error during agent cleanup: {cleanup_error}")
+                del self.agents[session_id]
+                logger.info(f"[{session_id}] Agent cleaned up")
+
+            # Clean up session-specific resources
+            self._send_locks.pop(session_id, None)
+            self._chat_in_progress.pop(session_id, None)
+
+            # Close session logger
+            close_session_logger(session_id)
 
     async def send_message(self, session_id: str, message: dict):
         """

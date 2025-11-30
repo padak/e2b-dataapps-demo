@@ -77,6 +77,16 @@ This is non-negotiable:
 - Tables referenced as `"SCHEMA"."bucket_id"."table_name"`
 - Read-only access through workspace credentials
 
+**CRITICAL: Snowflake SQL - ALWAYS Use Double Quotes:**
+Snowflake UPPERCASES all identifiers unless quoted. ALWAYS quote everything:
+- Table names: `FROM "out.c-amplitude"."events"`
+- Column names: `SELECT "event_type", "user_id"`
+- Aliases: `COUNT(*) as "count"`, `SUM("amount") as "total"`
+
+Examples:
+- ❌ `SELECT event_type, COUNT(*) as count FROM events`
+- ✅ `SELECT "event_type", COUNT(*) as "count" FROM "out.c-amplitude"."events"`
+
 **Common Keboola Patterns:**
 - Input buckets (`in.c-*`) contain source data from extractors
 - Output buckets (`out.c-*`) contain transformed/processed data
@@ -147,72 +157,97 @@ Instead of generic "what data do you want?", ask contextual questions:
 # =============================================================================
 
 CURATED_COMPONENTS_KNOWLEDGE = """
-### Curated Component Library
+### Pre-installed Curated Components
 
-You have access to pre-built, tested components. **Use them as boilerplate** instead of
-generating from scratch - they're proven to work and save time.
+**IMPORTANT: These components are ALREADY COPIED to every sandbox at initialization.**
+You don't need to create them - just import and use them!
 
-**Available Components:**
+**What's Pre-installed in Your Sandbox:**
 
-1. **DataTable** (`components/curated/data-table/`)
-   - Interactive table with sorting, filtering, pagination
-   - Column visibility toggle, global search
-   - Auto-generates columns from data
-   - Loading skeleton included
-   - **Use when:** Displaying tabular data, query results, data exploration
-
-2. **KeboolaStoragePicker** (`components/curated/data-table/KeboolaStoragePicker.tsx`)
-   - Schema and table picker for Keboola storage
-   - Preloads all schemas/tables for instant switching
-   - **Use when:** User needs to select data source
-
-3. **Keboola Query Client** (`components/curated/keboola.ts`) - **REQUIRED**
-   - Ready-to-use client for Keboola Query Service API
-   - Handles async job polling, error handling
-   - Functions: `queryData()`, `listSchemas()`, `listTables()`
-   - **ALWAYS use this** for any data fetching in API routes
-   - This is the ONLY approved way to fetch data from Keboola
-
-**How to Use Curated Components:**
-
-1. Copy the component files to your app
-2. Copy required UI primitives from `components/ui/`
-3. Import and use with your data
-
-**Example - Using DataTable:**
-```typescript
-import { DataTable } from '@/components/DataTable'
-
-// In your page/component:
-<DataTable
-  data={queryResults}
-  isLoading={isLoading}
-  pageSize={25}
-/>
+```
+lib/
+  keboola.ts          # Keboola Query Service client (ALWAYS use this!)
+  utils.ts            # Utility functions (cn, etc.)
+components/
+  ui/                 # shadcn/ui primitives (button, table, input, badge, skeleton, dropdown-menu)
+  data-table/         # DataTable and KeboolaStoragePicker components
+app/
+  api/keboola/route.ts  # API route for Keboola data fetching
+curated-registry.json   # Component metadata (read this for usage details)
 ```
 
-**Component Registry Location:**
-The full registry with descriptions is at `components/curated/components.json`
+**How to Use Pre-installed Components:**
 
-**UI Primitives Available:**
-- Button, Input, Table (from shadcn/ui)
-- DropdownMenu for actions
-- Badge for status indicators
-- Skeleton for loading states
+1. **DataTable** - Import from `@/components/data-table`
+   ```typescript
+   import { DataTable } from '@/components/data-table'
 
-### When to Use Curated vs. Generate
+   // Use with your data:
+   <DataTable data={results} isLoading={loading} />
+   ```
+   - Interactive table with sorting, filtering, pagination
+   - Auto-generates columns from data
+   - **Use when:** Displaying tabular data, query results
 
-**Use Curated Components when:**
-- Displaying data in a table → DataTable
-- Need schema/table selection → KeboolaStoragePicker
-- Fetching from Keboola → keboola.ts client
+2. **KeboolaStoragePicker** - Import from `@/components/data-table`
+   ```typescript
+   import { KeboolaStoragePicker } from '@/components/data-table'
+   ```
+   - Schema and table picker for Keboola storage
+   - **Use when:** User needs to select data source
 
-**Generate Custom when:**
-- Specific chart types (use recharts/plotly)
-- Unique UI requirements
+3. **Keboola Query Client** (`lib/keboola.ts`) - **REQUIRED FOR ALL DATA ACCESS**
+
+   **CRITICAL: This file is PRE-INSTALLED at `lib/keboola.ts` - just import and use it!**
+
+   - ✅ **ALWAYS** import: `import { queryData } from '@/lib/keboola'`
+   - ✅ Add `"@keboola/query-service": "^1.0.0"` to package.json dependencies
+   - ❌ **NEVER** create your own keboola client implementation
+   - ❌ **NEVER** use fetch/axios to call Keboola APIs directly
+
+   **Available Functions (read `lib/keboola.ts` for full implementation):**
+   - `queryData<T>(query: string): Promise<T[]>` - Execute SQL, returns typed rows
+   - `listSchemas(): Promise<string[]>` - List all schemas
+   - `listTables(schema: string): Promise<string[]>` - List tables in schema
+
+   **Usage Example:**
+   ```typescript
+   // app/api/data/route.ts
+   import { queryData } from '@/lib/keboola'
+
+   export async function GET() {
+     const data = await queryData<{ id: number; name: string }>(
+       'SELECT id, name FROM "SCHEMA"."bucket"."table" LIMIT 100'
+     )
+     return Response.json(data)
+   }
+   ```
+
+**Pre-installed UI Primitives (in `components/ui/`):**
+- `button.tsx` - Button with variants
+- `input.tsx` - Text input field
+- `table.tsx` - Base table components
+- `dropdown-menu.tsx` - Dropdown menu
+- `badge.tsx` - Badge/tag component
+- `skeleton.tsx` - Loading skeleton
+
+**Component Registry:**
+Read `curated-registry.json` in sandbox root for full component documentation.
+
+### When to Use Pre-installed vs. Generate Custom
+
+**Use Pre-installed Components:**
+- Displaying data in a table → `DataTable` (already in `components/data-table/`)
+- Need schema/table selection → `KeboolaStoragePicker` (already in `components/data-table/`)
+- Fetching from Keboola → `lib/keboola.ts` (ALWAYS use this, NEVER recreate)
+- Basic UI elements → `components/ui/*` (button, input, table, etc.)
+
+**Generate Custom ONLY when:**
+- Specific chart types (use recharts - you need to install it)
+- Unique UI requirements not covered by pre-installed components
 - Domain-specific visualizations
 
-**Always start from curated if applicable** - you can customize after copying.
+**REMEMBER: Components are already in your sandbox - just import them!**
 """
 
 # =============================================================================

@@ -163,7 +163,9 @@ Dynamic tool access control:
 | `/health` | GET | Health check |
 | `/api/session` | POST | Create new session |
 | `/api/sessions` | GET | List active sessions |
+| `/api/session/{id}/status` | GET | Check if session is active (for reconnect) |
 | `/ws/chat/{session_id}` | WS | Real-time chat |
+| `/ws/chat/{session_id}?reconnect=true` | WS | Reconnect to existing session |
 
 ## WebSocket Events
 
@@ -245,9 +247,130 @@ Each session creates logs in `logs/{session_id}/`:
 - **Async I/O** - Non-blocking file and network operations
 - **Connection pooling** - Efficient WebSocket management
 
+## Session Recovery & Persistence
+
+The application supports session recovery when users accidentally close the browser or lose connection.
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Browser (Frontend)                        │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              localStorage                            │   │
+│  │   Key: "e2b-app-builder-session"                    │   │
+│  │   Value: {                                          │   │
+│  │     sessionId: "20251130-...",                      │   │
+│  │     messages: [...],                                │   │
+│  │     codeFiles: [...],                               │   │
+│  │     previewUrl: "http://...",                       │   │
+│  │     sandboxId: "...",                               │   │
+│  │     timestamp: 1732987654321                        │   │
+│  │   }                                                 │   │
+│  │   TTL: 30 minutes                                   │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### localStorage
+
+**localStorage** is a browser Web Storage API that allows JavaScript to store key-value pairs persistently in the browser. Unlike cookies:
+- Data persists even after browser is closed
+- Not sent with HTTP requests (stays client-side)
+- ~5MB storage limit per domain
+- Synchronous API
+
+We use it to store session state (messages, files, preview URL) so users can recover after page refresh.
+
+### Recovery Flow
+
+1. **On page load** - Check localStorage for existing session
+2. **If found** - Check backend if agent is still alive (`/api/session/{id}/status`)
+3. **Show dialog** with options:
+   - **"Continue"** - Reconnect to existing agent + restore chat history
+   - **"Start New"** - Clear storage, create fresh session
+4. **Auto-save** - Session saved to localStorage on every state change
+
+### Backend Support
+
+- Agent stays alive after WebSocket disconnect (`keep_agent=True`)
+- WebSocket endpoint accepts `?reconnect=true` to reuse existing agent
+- Session status endpoint reports if reconnection is possible
+
+### Timeout Configuration
+
+| Component | Timeout | Description |
+|-----------|---------|-------------|
+| WebSocket response | 10 minutes | Max time for agent to respond |
+| localStorage TTL | 30 minutes | Session data expires |
+| Ping interval | 30 seconds | Keepalive to prevent disconnect |
+
+## Curated Components Auto-Injection
+
+When a new sandbox is created, the system automatically copies curated components:
+
+```
+Sandbox initialization
+       │
+       ▼
+_copy_curated_components()
+       │
+       ▼
+Creates in sandbox:
+  lib/keboola.ts          # Keboola Query Service client
+  lib/utils.ts            # Tailwind utilities (cn)
+  components/ui/          # shadcn/ui primitives (button, table, input, etc.)
+  components/data-table/  # DataTable, KeboolaStoragePicker
+  app/api/keboola/route.ts # API endpoint
+  curated-registry.json   # Component metadata
+```
+
+**Benefits:**
+- Agent doesn't need to generate boilerplate code
+- Pre-tested, working implementations
+- Consistent UI patterns across apps
+- Agent just imports: `import { queryData } from '@/lib/keboola'`
+
+## Session Recovery with Grace Period
+
+When WebSocket disconnects (e.g., page reload), the agent is NOT destroyed immediately:
+
+```
+WebSocket disconnect
+       │
+       ▼
+Schedule cleanup (60s grace period)
+       │
+       ├──→ Client reconnects within 60s → Cancel cleanup, reuse agent
+       │
+       └──→ 60s expires → Cleanup agent
+```
+
+**Configuration:**
+- `AGENT_CLEANUP_GRACE_PERIOD = 60` seconds
+- Allows page reloads without losing session
+- Agent memory preserved during grace period
+
 ## Known Limitations
 
 1. Local mode doesn't support multiple simultaneous sessions on same port range
 2. E2B mode has 30-minute timeout
 3. Large files may be truncated in logs
-4. No persistent session storage (memory only)
+4. Agent memory is in-process only (not persisted to disk)
+
+## Snowflake SQL Gotchas
+
+When generating SQL for Keboola Query Service (which uses Snowflake):
+
+**CRITICAL: Always use double quotes for identifiers!**
+
+Snowflake UPPERCASES all unquoted identifiers:
+- ❌ `SELECT event_type, COUNT(*) as count` → columns: `EVENT_TYPE`, `COUNT`
+- ✅ `SELECT "event_type", COUNT(*) as "count"` → columns: `event_type`, `count`
+
+**Rules:**
+- Quote table names: `FROM "out.c-amplitude"."events"`
+- Quote column names: `SELECT "user_id", "event_type"`
+- Quote aliases: `COUNT(*) as "count"`, `SUM("amount") as "total"`
+
+This is documented in the agent's system prompt (`backend/app/prompts/data_platform.py`).

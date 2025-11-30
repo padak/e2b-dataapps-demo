@@ -333,7 +333,27 @@ Return JSON:
 - Read-only best practices
 - Handling large datasets
 - Parameterized queries (security)
+- CRITICAL: Identifier quoting (see below)
 ```
+
+### Snowflake SQL Case Sensitivity ⚠️ DŮLEŽITÉ
+
+Snowflake UPPERCASES všechny nekvotované identifikátory. **VŽDY používej dvojité uvozovky:**
+
+```sql
+-- ❌ ŠPATNĚ - vrátí sloupce EVENT_TYPE, COUNT
+SELECT event_type, COUNT(*) as count FROM events
+
+-- ✅ SPRÁVNĚ - vrátí sloupce event_type, count
+SELECT "event_type", COUNT(*) as "count" FROM "out.c-amplitude"."events"
+```
+
+**Pravidla:**
+- Tabulky: `FROM "bucket_id"."table_name"`
+- Sloupce: `SELECT "column_name"`
+- Aliasy: `COUNT(*) as "count"`, `SUM("amount") as "total"`
+
+Toto je dokumentováno v system promptu agenta (`backend/app/prompts/data_platform.py`).
 
 ### Jak agent přemýšlí
 
@@ -513,31 +533,28 @@ Agent potřebuje vědět jaké komponenty má k dispozici:
    → Agent strávil čas logikou, ne UI bugfixing
 ```
 
-### Injekce do Sandboxu
+### Injekce do Sandboxu ✅ IMPLEMENTOVÁNO
 
-Při vytváření nové aplikace:
+Při vytváření sandboxu se **automaticky** kopírují curated komponenty:
 
 ```python
-# Backend při vytváření sandboxu
-def setup_sandbox(sandbox_path: str):
-    # 1. Zkopírovat curated komponenty
-    shutil.copytree(
-        "components/curated/",
-        f"{sandbox_path}/components/curated/"
-    )
+# LocalSandboxManager._copy_curated_components()
+# Volá se automaticky v ensure_sandbox()
 
-    # 2. Zkopírovat UI primitives
-    shutil.copytree(
-        "components/curated/components/ui/",
-        f"{sandbox_path}/components/ui/"
-    )
-
-    # 3. Zkopírovat shared utilities
-    shutil.copy(
-        "components/curated/lib/utils.ts",
-        f"{sandbox_path}/lib/utils.ts"
-    )
+# Co se nakopíruje:
+lib/keboola.ts          # Keboola Query Service client
+lib/utils.ts            # Tailwind utilities (cn)
+components/ui/          # shadcn/ui primitives (6 souborů)
+components/data-table/  # DataTable, KeboolaStoragePicker
+app/api/keboola/route.ts # API endpoint pro Keboola
+curated-registry.json   # Metadata komponent pro agenta
 ```
+
+**Agent workflow:**
+1. Sandbox se inicializuje → komponenty jsou automaticky nakopírovány
+2. Agent vidí `curated-registry.json` a ví co má k dispozici
+3. Agent jen importuje: `import { queryData } from '@/lib/keboola'`
+4. Nemusí nic generovat od nuly
 
 ### Verzování
 
@@ -768,6 +785,33 @@ Agent zvládne široké spektrum požadavků bez předpřipravených šablon:
 
 Agent rozpozná kontext a zeptá se na relevantní věci.
 
+## Session Recovery ✅ IMPLEMENTOVÁNO
+
+### Grace Period pro Reconnect
+
+Když se WebSocket odpojí (např. page reload), agent se **nezničí okamžitě**:
+
+```
+WebSocket disconnect
+       │
+       ▼
+Naplánovat cleanup (60s grace period)
+       │
+       ├──→ Klient se připojí zpět do 60s → Zrušit cleanup, použít existující agent
+       │
+       └──→ 60s vyprší → Cleanup agent
+```
+
+**Konfigurace:**
+- `AGENT_CLEANUP_GRACE_PERIOD = 60` sekund
+- Umožňuje page reload bez ztráty session
+- Agent memory zachována během grace period
+
+**Implementace:**
+- `websocket.py`: `_delayed_cleanup()`, `_cleanup_agent()`
+- `disconnect(keep_agent=True)` → naplánuje cleanup s grace period
+- `connect(reconnect=True)` → zruší pending cleanup a použije existující agent
+
 ## Pro budoucí produkci (mimo MVP)
 
 Věci které teď neřešíme, ale budeme potřebovat:
@@ -928,6 +972,8 @@ Keboola workspace poskytuje Snowflake credentials:
 | Planning subagenty | `backend/app/agent.py` (AGENTS dict) | requirements-analyzer, planning-agent, plan-validator |
 | Planning hooks | `backend/app/agent.py` (HOOKS dict) | track_planning_state, suggest_planning_on_new_request, self_heal_planning_issues |
 | Planning test | `scripts/test_planning_flow.py` | Test suite pro planning module |
+| Curated auto-copy | `backend/app/local_sandbox_manager.py` | `_copy_curated_components()` - automatická injekce komponent |
+| Session recovery | `backend/app/websocket.py` | Grace period 60s, `_delayed_cleanup()`, `_cleanup_agent()` |
 
 ### Testovací prostředí
 

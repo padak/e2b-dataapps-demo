@@ -139,14 +139,39 @@ async def list_sessions():
         raise HTTPException(status_code=500, detail="Failed to list sessions")
 
 
+@app.get("/api/session/{session_id}/status")
+async def get_session_status(session_id: str):
+    """
+    Check if a session exists and is active.
+
+    Returns:
+        Session status and whether it can be reconnected to
+    """
+    try:
+        is_active = session_id in manager.active_connections
+        has_agent = session_id in manager.agents
+
+        return {
+            "session_id": session_id,
+            "is_active": is_active,
+            "has_agent": has_agent,
+            "can_reconnect": has_agent,  # Can reconnect if agent still exists
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error checking session status: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to check session status")
+
+
 @app.websocket("/ws/chat/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
+async def websocket_endpoint(websocket: WebSocket, session_id: str, reconnect: bool = False):
     """
     WebSocket endpoint for real-time chat communication.
 
     Args:
         websocket: WebSocket connection
         session_id: Unique session identifier
+        reconnect: If True, try to reconnect to existing session/agent
 
     The WebSocket accepts JSON messages with the following format:
     {
@@ -162,8 +187,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     }
     """
     try:
-        # Connect and initialize
-        await manager.connect(websocket, session_id)
+        # Connect and initialize (or reconnect to existing agent)
+        await manager.connect(websocket, session_id, reconnect=reconnect)
 
         logger.info(f"WebSocket connection established: {session_id}")
 
@@ -202,9 +227,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         logger.error(f"Error in WebSocket endpoint for {session_id}: {e}", exc_info=True)
 
     finally:
-        # Always cleanup on exit
-        await manager.disconnect(session_id)
-        logger.info(f"WebSocket connection closed: {session_id}")
+        # Cleanup on exit - keep agent alive for 5 minutes for potential reconnect
+        # Agent will be fully cleaned up on explicit reset or session timeout
+        await manager.disconnect(session_id, keep_agent=True)
+        logger.info(f"WebSocket connection closed: {session_id} (agent kept for reconnect)")
 
 
 @app.get("/")

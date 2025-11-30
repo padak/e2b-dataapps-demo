@@ -1,5 +1,8 @@
 type MessageHandler = (data: any) => void;
 
+// Ping interval to keep connection alive during long operations (30 seconds)
+const PING_INTERVAL = 30000;
+
 export class WebSocketClient {
   private ws: WebSocket | null = null;
   private sessionId: string;
@@ -7,27 +10,30 @@ export class WebSocketClient {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
   private reconnectTimeout: number | null = null;
+  private pingInterval: number | null = null;
   private isIntentionallyClosed = false;
 
   constructor(sessionId: string) {
     this.sessionId = sessionId;
   }
 
-  async connect(): Promise<void> {
+  async connect(reconnect: boolean = false): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
         this.isIntentionallyClosed = false;
 
-        // Determine WebSocket URL
+        // Determine WebSocket URL with reconnect query param
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const host = window.location.host;
-        const wsUrl = `${protocol}//${host}/ws/chat/${this.sessionId}`;
+        const reconnectParam = reconnect ? '?reconnect=true' : '';
+        const wsUrl = `${protocol}//${host}/ws/chat/${this.sessionId}${reconnectParam}`;
 
         this.ws = new WebSocket(wsUrl);
 
         this.ws.onopen = () => {
           console.log('[WebSocket] Connected to session:', this.sessionId);
           this.reconnectAttempts = 0;
+          this.startPingInterval();
           resolve();
         };
 
@@ -90,6 +96,8 @@ export class WebSocketClient {
   disconnect(): void {
     this.isIntentionallyClosed = true;
 
+    this.stopPingInterval();
+
     if (this.reconnectTimeout !== null) {
       clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
@@ -102,6 +110,22 @@ export class WebSocketClient {
 
     this.handlers.clear();
     console.log('[WebSocket] Disconnected');
+  }
+
+  private startPingInterval(): void {
+    this.stopPingInterval();
+    this.pingInterval = window.setInterval(() => {
+      if (this.isConnected) {
+        this.send('ping');
+      }
+    }, PING_INTERVAL);
+  }
+
+  private stopPingInterval(): void {
+    if (this.pingInterval !== null) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
   }
 
   get isConnected(): boolean {

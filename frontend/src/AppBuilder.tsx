@@ -13,7 +13,9 @@ import {
 import ChatPanel from './components/chat/ChatPanel';
 import PreviewPanel from './components/preview/PreviewPanel';
 import ThemeToggle from './components/ThemeToggle';
+import SessionRecoveryDialog from './components/SessionRecoveryDialog';
 import { useTheme } from './hooks/useTheme';
+import { useSessionStorage } from './hooks/useSessionStorage';
 import { useAppStore } from './lib/store';
 import { WebSocketClient } from './lib/websocket';
 import { Message, ChatState, ToolUse } from './types/chat';
@@ -45,11 +47,17 @@ function formatToolLog(toolName: string, input: any): string {
     case 'Grep':
       return `🔎 Grep: "${input?.pattern || ''}" in ${input?.path || '.'}`;
 
-    // Task/Subagents
+    // Task/Subagents - show clear subagent label
     case 'Task': {
-      const agent = input?.subagent_type || input?.description || 'agent';
-      const desc = input?.description ? ` - ${input.description}` : '';
-      return `🤖 Task: ${agent}${desc}`;
+      const agent = input?.subagent_type || 'unknown';
+      const desc = input?.description || '';
+      // Use emoji based on agent type
+      const emoji = agent.includes('security') ? '🔒'
+                  : agent.includes('review') ? '👀'
+                  : agent.includes('fix') ? '🔧'
+                  : agent.includes('plan') ? '📝'
+                  : '🤖';
+      return `${emoji} [${agent}] ${desc}`;
     }
 
     // Todo management
@@ -118,6 +126,12 @@ export default function AppBuilder() {
   const [currentAction, setCurrentAction] = useState<string>('');
   const [toolCount, setToolCount] = useState(0);
   const [startTime, setStartTime] = useState<number | null>(null);
+  // Session recovery
+  const { saveSession, loadSession, clearSession } = useSessionStorage();
+  const [showRecoveryDialog, setShowRecoveryDialog] = useState(false);
+  const [storedSession, setStoredSession] = useState<ReturnType<typeof loadSession>>(null);
+  const [canReconnect, setCanReconnect] = useState(false);
+  const initializingRef = useRef(false); // Guard against double-init in StrictMode
 
   const {
     messages,
@@ -142,74 +156,146 @@ export default function AppBuilder() {
     isConnected,
   };
 
-  // Initialize WebSocket connection with proper StrictMode cleanup
-  // Uses ref-based pattern to handle async cleanup race conditions
+  // Check for existing session on mount
   useEffect(() => {
-    // Track if component is still mounted (handles StrictMode double-mount)
-    let mounted = true;
-    // Ref to track the current WebSocket client for cleanup
-    const wsClientRef: { current: WebSocketClient | null } = { current: null };
+    // Guard against double-init in React StrictMode
+    if (initializingRef.current) return;
+    initializingRef.current = true;
 
-    const initSession = async () => {
-      try {
-        // Check if still mounted before starting
-        if (!mounted) return;
-
-        // Create session via API
-        const response = await fetch('/api/session', { method: 'POST' });
-        if (!response.ok) throw new Error('Failed to create session');
-
-        // Check again after async operation
-        if (!mounted) return;
-
-        const data = await response.json();
-        const newSessionId = data.session_id;
-        setSessionId(newSessionId);
-
-        // Connect WebSocket
-        const client = new WebSocketClient(newSessionId);
-        wsClientRef.current = client;
-
-        client.onMessage((event) => {
-          // Only process events if still mounted
-          if (mounted) {
-            handleWebSocketEvent(event);
-          }
+    const stored = loadSession();
+    if (stored && stored.messages.length > 0) {
+      setStoredSession(stored);
+      // Check if backend session is still active
+      fetch(`/api/session/${stored.sessionId}/status`)
+        .then(res => res.json())
+        .then(data => {
+          setCanReconnect(data.can_reconnect);
+          setShowRecoveryDialog(true);
+        })
+        .catch(() => {
+          // Backend not available, still show dialog for local restore
+          setCanReconnect(false);
+          setShowRecoveryDialog(true);
         });
+    } else {
+      // No stored session, start fresh
+      initNewSession();
+    }
+  }, []);
 
-        await client.connect();
+  // Ref to track the current WebSocket client for cleanup
+  const wsClientRef = useRef<WebSocketClient | null>(null);
 
-        // Check if component unmounted during connection
-        if (!mounted) {
-          client.disconnect();
-          return;
-        }
+  // Initialize a new session
+  const initNewSession = useCallback(async () => {
+    try {
+      // Create session via API
+      const response = await fetch('/api/session', { method: 'POST' });
+      if (!response.ok) throw new Error('Failed to create session');
 
-        setWsClient(client);
-        setConnected(true);
-        addLog('Connected to App Builder', 'info');
+      const data = await response.json();
+      const newSessionId = data.session_id;
+      setSessionId(newSessionId);
 
-      } catch (error) {
-        console.error('Failed to initialize session:', error);
-        if (mounted) {
-          addLog(`Connection error: ${error instanceof Error ? error.message : 'Unknown error'}`, 'stderr');
-          setConnected(false);
-        }
-      }
-    };
+      // Connect WebSocket
+      const client = new WebSocketClient(newSessionId);
+      wsClientRef.current = client;
 
-    initSession();
+      client.onMessage((event) => {
+        handleWebSocketEvent(event);
+      });
 
-    // Cleanup function - runs on unmount (including StrictMode remount)
+      await client.connect();
+
+      setWsClient(client);
+      setConnected(true);
+      addLog('Connected to App Builder', 'info');
+
+    } catch (error) {
+      console.error('Failed to initialize session:', error);
+      addLog(`Connection error: ${error instanceof Error ? error.message : 'Unknown error'}`, 'stderr');
+      setConnected(false);
+    }
+  }, [setSessionId, setConnected]);
+
+  // Recover existing session
+  const recoverSession = useCallback(async (stored: NonNullable<ReturnType<typeof loadSession>>) => {
+    try {
+      setSessionId(stored.sessionId);
+
+      // Restore local state
+      stored.messages.forEach(msg => addMessage(msg));
+      setCodeFiles(stored.codeFiles || []);
+      if (stored.previewUrl) setPreviewUrl(stored.previewUrl);
+      if (stored.sandboxId) setSandboxId(stored.sandboxId);
+
+      // Connect WebSocket with reconnect flag
+      const client = new WebSocketClient(stored.sessionId);
+      wsClientRef.current = client;
+
+      client.onMessage((event) => {
+        handleWebSocketEvent(event);
+      });
+
+      await client.connect(true); // Pass reconnect=true
+
+      setWsClient(client);
+      setConnected(true);
+      addLog(`Reconnected to session ${stored.sessionId}`, 'info');
+
+    } catch (error) {
+      console.error('Failed to recover session:', error);
+      addLog(`Recovery error: ${error instanceof Error ? error.message : 'Unknown error'}`, 'stderr');
+      // Fall back to new session
+      clearSession();
+      await initNewSession();
+    }
+  }, [setSessionId, addMessage, setPreviewUrl, setSandboxId, setConnected, clearSession, initNewSession]);
+
+  // Handle recovery dialog actions
+  const handleRecover = useCallback(() => {
+    setShowRecoveryDialog(false);
+    if (storedSession) {
+      recoverSession(storedSession);
+    }
+  }, [storedSession, recoverSession]);
+
+  const handleStartNew = useCallback(() => {
+    setShowRecoveryDialog(false);
+    clearSession();
+    initNewSession();
+  }, [clearSession, initNewSession]);
+
+  const handleDismissRecovery = useCallback(() => {
+    setShowRecoveryDialog(false);
+    // Start new session if dismissed
+    clearSession();
+    initNewSession();
+  }, [clearSession, initNewSession]);
+
+  // Cleanup on unmount
+  useEffect(() => {
     return () => {
-      mounted = false;
-      // Disconnect the WebSocket client if it exists
       if (wsClientRef.current) {
         wsClientRef.current.disconnect();
         wsClientRef.current = null;
       }
     };
   }, []);
+
+  // Auto-save session to localStorage on state changes
+  const sessionId = useAppStore(state => state.sessionId);
+  useEffect(() => {
+    if (sessionId && messages.length > 0) {
+      saveSession({
+        sessionId,
+        messages,
+        codeFiles,
+        previewUrl,
+        sandboxId,
+      });
+    }
+  }, [sessionId, messages, codeFiles, previewUrl, sandboxId, saveSession]);
 
   // Add console log
   const addLog = useCallback((message: string, type: ConsoleLog['type'] = 'info') => {
@@ -412,10 +498,11 @@ export default function AppBuilder() {
     setToolUses([]);
     setPreviewUrl(null);
     setSandboxId(null);
+    clearSession(); // Clear localStorage
 
     wsClient.send('reset');
     addLog('Session reset', 'info');
-  }, [wsClient, reset, setPreviewUrl, setSandboxId, addLog]);
+  }, [wsClient, reset, setPreviewUrl, setSandboxId, addLog, clearSession]);
 
   // Clear console logs
   const handleClearConsole = useCallback(() => {
@@ -596,6 +683,18 @@ export default function AppBuilder() {
           </div>
         </div>
       </main>
+
+      {/* Session Recovery Dialog */}
+      <SessionRecoveryDialog
+        isOpen={showRecoveryDialog}
+        sessionId={storedSession?.sessionId || ''}
+        messageCount={storedSession?.messages.length || 0}
+        timestamp={storedSession?.timestamp || 0}
+        canReconnect={canReconnect}
+        onRecover={handleRecover}
+        onStartNew={handleStartNew}
+        onDismiss={handleDismissRecovery}
+      />
     </div>
   );
 }
