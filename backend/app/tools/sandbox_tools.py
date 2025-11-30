@@ -690,6 +690,99 @@ async def sandbox_start_dev_server(args: dict[str, Any]) -> dict[str, Any]:
         }
 
 
+# Import security review state management
+from ..security.security_review import mark_security_review_completed, reset_security_review
+
+
+@tool(
+    "mark_security_review_passed",
+    "Mark security review as passed for this session. Call this AFTER running security-reviewer subagent and confirming the code is safe (safe=true with no high severity issues). This allows the dev server to start.",
+    {"passed": bool, "summary": str}
+)
+async def mark_security_review_passed(args: dict[str, Any]) -> dict[str, Any]:
+    """
+    Mark security review as completed for the current session.
+
+    Args:
+        passed: True if security review passed (safe=true, no high severity issues)
+        summary: Brief summary of the review result
+
+    Returns:
+        Confirmation message
+    """
+    start_time = time.time()
+    session_id = get_session_id()
+    slogger = get_session_logger(session_id) if session_id else None
+    tool_id = f"tool_{int(start_time*1000)}"
+
+    passed = args.get("passed", False)
+    summary = args.get("summary", "")
+    logger.info(f"[TOOL] mark_security_review_passed called: passed={passed}, summary={summary[:100]}")
+
+    try:
+        if not session_id:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": "Error: No session ID available"
+                }],
+                "isError": True
+            }
+
+        # Mark the security review as completed
+        mark_security_review_completed(session_id, passed, summary)
+
+        duration_ms = (time.time() - start_time) * 1000
+        logger.info(f"[TOOL] mark_security_review_passed success: session={session_id}, passed={passed}")
+
+        if slogger:
+            slogger.log_tool_call(
+                tool_id=tool_id,
+                tool_name="mark_security_review_passed",
+                input_data=args,
+                duration_ms=duration_ms,
+                success=True,
+                output={"passed": passed}
+            )
+
+        if passed:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": f"Security review PASSED. You can now start the dev server.\n\nSummary: {summary}"
+                }]
+            }
+        else:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": f"Security review FAILED. Fix the issues before starting dev server.\n\nIssues: {summary}"
+                }]
+            }
+
+    except Exception as e:
+        duration_ms = (time.time() - start_time) * 1000
+        logger.error(f"[TOOL] mark_security_review_passed failed: {e}", exc_info=True)
+
+        if slogger:
+            slogger.log_tool_call(
+                tool_id=tool_id,
+                tool_name="mark_security_review_passed",
+                input_data=args,
+                duration_ms=duration_ms,
+                success=False,
+                output=str(e)
+            )
+
+        return {
+            "content": [{
+                "type": "text",
+                "text": f"Error marking security review: {str(e)}"
+            }],
+            "isError": True
+        }
+
+
 def create_sandbox_tools_server(sandbox_manager, session_id: str = None):
     """
     Create an MCP server with ALL E2B sandbox tools (legacy, for E2B cloud mode).
@@ -747,5 +840,6 @@ def create_e2b_only_server(sandbox_manager, session_id: str = None):
         tools=[
             sandbox_get_preview_url,
             sandbox_start_dev_server,
+            mark_security_review_passed,
         ]
     )

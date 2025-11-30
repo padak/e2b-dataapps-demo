@@ -676,16 +676,26 @@ npm run dev načte .env.local
 App má přístup k process.env.KBC_URL, KBC_TOKEN, etc.
 ```
 
-### Fáze 5: Security Reviewer
+### Fáze 5: Security Reviewer ✅ DONE
 
 **Soubory:**
-- Upravit `backend/app/agent.py` - přidat security-reviewer subagent
+- `backend/app/agent.py` - security-reviewer subagent a hooks
+- `backend/app/security/security_review.py` - state management
+- `backend/app/tools/sandbox_tools.py` - mark_security_review_passed tool
+- `scripts/test_security_reviewer.py` - test suite
 
 **Úkoly:**
-1. Implementovat security-reviewer agent (Haiku)
-2. Kontrola exfiltrace, credential leaks, SQL injection
-3. Hook před spuštěním dev serveru
-4. Workflow: fail → agent opraví → retry
+1. ✅ Implementovat security-reviewer agent (Haiku)
+2. ✅ Kontrola exfiltrace, credential leaks, SQL injection
+3. ✅ Hook před spuštěním dev serveru (require_security_review)
+4. ✅ Workflow: fail → agent opraví → retry (invalidate_security_review_on_code_change)
+
+**Implementováno:**
+- `security-reviewer` subagent - skenuje kód na SQL injection, exfiltrace, credential leaky
+- `require_security_review` PreToolUse hook - blokuje dev server dokud review neprojde
+- `invalidate_security_review_on_code_change` PostToolUse hook - resetuje review při změnách kódu
+- `mark_security_review_passed` MCP tool - agent zavolá po úspěšné review
+- Test suite: 13 testů prošlo
 
 ### Fáze 6: Interactive Planning Flow
 
@@ -848,16 +858,16 @@ Keboola workspace poskytuje Snowflake credentials:
 2. ✅ **Curated Component Library** - konzistentní UI
 3. ✅ **Keboola MCP Integration** - připojení k datům
 4. ✅ **Data Context Injection** - credentials do sandboxu
-5. ⏳ **Security Reviewer** - bezpečnostní kontrola ← DALŠÍ
-6. ⏳ **Interactive Planning** - lepší dialog s uživatelem
+5. ✅ **Security Reviewer** - bezpečnostní kontrola
+6. ⏳ **Interactive Planning** - lepší dialog s uživatelem ← DALŠÍ
 
-Fáze 0-4 jsou hotové, Fáze 5-6 vylepší bezpečnost a UX.
+Fáze 0-5 jsou hotové, Fáze 6 vylepší UX.
 
 ---
 
 ## Hotové artefakty (quick reference)
 
-### Fáze 0-4 výstupy
+### Fáze 0-5 výstupy
 
 | Artefakt | Cesta | Popis |
 |----------|-------|-------|
@@ -874,6 +884,11 @@ Fáze 0-4 jsou hotové, Fáze 5-6 vylepší bezpečnost a UX.
 | Agent MCP test | `scripts/test_agent_keboola_mcp.py` | Test integrace MCP v agentovi |
 | Data context module | `backend/app/context/data_context.py` | DataContext, KeboolaCredentials, inject_credentials_to_env() |
 | Data context test | `scripts/test_data_context.py` | Test suite pro credentials injection |
+| Security review module | `backend/app/security/security_review.py` | State management pro security review |
+| Security reviewer subagent | `backend/app/agent.py` (AGENTS dict) | security-reviewer - Haiku model, kontroluje SQL injection, exfiltrace |
+| Security review hooks | `backend/app/agent.py` (HOOKS dict) | require_security_review, invalidate_security_review_on_code_change |
+| Security review tool | `backend/app/tools/sandbox_tools.py` | mark_security_review_passed - MCP tool |
+| Security review test | `scripts/test_security_reviewer.py` | Test suite pro security review (13 testů) |
 
 ### Testovací prostředí
 
@@ -889,6 +904,9 @@ cd scripts && python test_keboola_mcp.py
 
 # Data context test
 source .venv/bin/activate && python scripts/test_data_context.py
+
+# Security review test
+source .venv/bin/activate && python scripts/test_security_reviewer.py
 ```
 
 ### Environment variables (.env)

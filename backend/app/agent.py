@@ -163,9 +163,34 @@ If build fails:
 ### Subagents Available
 
 You can delegate tasks to specialized subagents using the Task tool:
+- `security-reviewer`: **REQUIRED** - Reviews code for security vulnerabilities. Must run before dev server.
 - `code-reviewer`: Reviews TypeScript/React code for errors. Use when build fails.
 - `error-fixer`: Fixes specific code errors identified by code-reviewer.
 - `component-generator`: Generates React components with TypeScript and Tailwind.
+
+### CRITICAL: Security Review Before Preview
+
+**Before starting the dev server, you MUST run a security review:**
+
+1. After build succeeds, use Task tool with `subagent_type="security-reviewer"`:
+   ```
+   Task tool:
+     subagent_type: "security-reviewer"
+     prompt: "Review all source files in this project for security vulnerabilities.
+              Check for SQL injection, data exfiltration, credential leaks, and dangerous patterns."
+   ```
+
+2. Parse the JSON response from security-reviewer:
+   - If `safe: true` → call `mcp__e2b__mark_security_review_passed` with `passed: true`
+   - If `safe: false` with HIGH severity issues → fix the issues first, then re-run review
+
+3. Only after security review passes can you start the dev server.
+
+**What security-reviewer checks:**
+- SQL injection (user input in queries)
+- Data exfiltration (unauthorized external API calls)
+- Credential leaks (logging process.env, exposing secrets)
+- Dangerous patterns (eval, dangerouslySetInnerHTML with user input)
 
 """ + DATA_PLATFORM_PROMPT
 
@@ -174,6 +199,82 @@ You can delegate tasks to specialized subagents using the Task tool:
 # =============================================================================
 
 AGENTS = {
+    "security-reviewer": AgentDefinition(
+        description="Reviews generated code for security issues. Use before starting dev server.",
+        prompt="""You are a security code reviewer for generated Next.js applications.
+
+## Your Task
+Review the generated application code for security vulnerabilities:
+
+1. **Data Exfiltration** - Code sending data to external endpoints
+   - Unauthorized fetch/axios calls to non-Keboola domains
+   - WebSocket connections to unknown servers
+   - Image/script sources from untrusted origins
+
+2. **Credential Leaks** - Logging or exposing environment variables
+   - console.log with process.env values
+   - Exposing secrets in client-side code
+   - Credentials in error messages
+
+3. **SQL Injection** - User input in SQL queries without sanitization
+   - String concatenation: `SELECT * FROM ${userInput}`
+   - Template literals with user input in queries
+   - Dynamic table/column names from user input
+   - Missing parameterized queries
+
+4. **Unauthorized Actions** - Code doing things user didn't request
+   - Hidden API calls
+   - Unexpected data modifications
+   - Covert data collection
+
+5. **Dangerous Patterns**
+   - eval() with user input
+   - dangerouslySetInnerHTML with user input
+   - Dynamic require/import with user input
+   - Unvalidated redirects
+
+## Safe Patterns (OK)
+- Parameterized queries with placeholders
+- Whitelisted values for dynamic SQL parts
+- Input validation before query
+- Fetch to Keboola Query Service API
+- Environment variables read server-side only
+
+## Process
+1. Use Glob to find all source files (*.ts, *.tsx, *.js)
+2. Use Grep to search for dangerous patterns
+3. Use Read to examine suspicious code in context
+4. Report findings in JSON format
+
+## Output Format
+Return ONLY valid JSON (no markdown, no extra text):
+{
+  "safe": true/false,
+  "issues": [
+    {
+      "severity": "high|medium|low",
+      "type": "sql_injection|exfiltration|credential_leak|unauthorized_action|dangerous_pattern",
+      "file": "path/to/file.tsx",
+      "line": 42,
+      "description": "Description of the issue",
+      "code_snippet": "The problematic code",
+      "fix_suggestion": "How to fix it"
+    }
+  ],
+  "summary": "Brief assessment of overall security posture"
+}
+
+## Severity Guidelines
+- **high**: Immediate security risk (SQL injection, credential leak, data exfiltration)
+- **medium**: Potential risk that needs attention (unsafe patterns, missing validation)
+- **low**: Best practice violation (minor security hygiene issues)
+
+Mark as safe=false if ANY high severity issue is found.
+""",
+        tools=["Read", "Glob", "Grep"],
+        model="haiku"  # Cost-effective for review tasks
+    ),
+
     "code-reviewer": AgentDefinition(
         description="Reviews TypeScript/React code for errors. Use when build fails or you need code review.",
         prompt="""You are an expert TypeScript/React code reviewer.
@@ -362,13 +463,150 @@ async def log_tool_usage(
     return {}
 
 
+# Import security review state management from dedicated module
+from .security.security_review import (
+    mark_security_review_completed,
+    reset_security_review,
+    get_security_review_state,
+)
+
+
+async def require_security_review(
+    input_data: dict,
+    tool_use_id: str | None,
+    context: dict
+) -> dict:
+    """
+    PreToolUse hook - requires security review before starting dev server.
+
+    This hook intercepts sandbox_start_dev_server calls and checks if
+    a security review has been completed. If not, it blocks the call
+    and instructs the agent to run security-reviewer first.
+    """
+    tool_name = input_data.get("tool_name", "unknown")
+
+    # Only intercept dev server start
+    if tool_name != "mcp__e2b__sandbox_start_dev_server":
+        return {}
+
+    # Get session ID from context
+    session_id = context.get("session_id", "unknown")
+
+    # Check if security review was completed for this session
+    session_state = get_security_review_state(session_id)
+    review_completed = session_state.get("security_review_completed", False)
+    review_passed = session_state.get("security_review_passed", False)
+
+    if review_completed and review_passed:
+        # Security review passed - allow dev server to start
+        logger.info(f"[SECURITY] Session {session_id}: Security review passed, allowing dev server start")
+        return {}
+
+    if review_completed and not review_passed:
+        # Security review failed - block and require fixes
+        issues_summary = session_state.get("issues_summary", "Unknown issues")
+        logger.warning(f"[SECURITY] Session {session_id}: Security review failed, blocking dev server")
+        return {
+            "decision": "block",
+            "reason": f"""## Security Review Failed - Fixes Required
+
+The security review found issues that must be fixed before starting the dev server.
+
+### Issues Found:
+{issues_summary}
+
+### Required Actions:
+1. Fix all HIGH severity security issues identified
+2. Run security-reviewer again to verify fixes
+3. Only then start the dev server
+
+Do NOT attempt to start the dev server until security issues are resolved.
+"""
+        }
+
+    # Security review not yet done - block and require review
+    logger.info(f"[SECURITY] Session {session_id}: Security review required before dev server start")
+    return {
+        "decision": "block",
+        "reason": """## Security Review Required
+
+Before starting the dev server, you MUST run a security review of the generated code.
+
+### Required Actions:
+1. Use the `security-reviewer` subagent (via Task tool) to scan the codebase:
+   ```
+   Task tool with subagent_type="security-reviewer"
+   Prompt: "Review all source files in this project for security vulnerabilities"
+   ```
+
+2. If the review returns `safe: true`:
+   - Call `mark_security_review_passed` tool to record success
+   - Then start the dev server
+
+3. If the review returns `safe: false` with HIGH severity issues:
+   - Fix the identified issues
+   - Run security-reviewer again
+   - Only proceed when all HIGH severity issues are resolved
+
+This security check protects against SQL injection, data exfiltration, and credential leaks.
+"""
+    }
+
+
+async def invalidate_security_review_on_code_change(
+    input_data: dict,
+    tool_use_id: str | None,
+    context: dict
+) -> dict:
+    """
+    PostToolUse hook - invalidates security review when code is modified.
+
+    If files are changed after security review passed, the review is reset
+    to require a new security check before starting the dev server.
+    """
+    tool_name = input_data.get("tool_name", "unknown")
+
+    # Only care about file modification tools
+    if tool_name not in ["Write", "Edit"]:
+        return {}
+
+    # Get session ID from context
+    session_id = context.get("session_id", "unknown")
+
+    # Check if there's a completed security review for this session
+    session_state = get_security_review_state(session_id)
+    if session_state.get("security_review_completed", False):
+        # Code was modified after security review - invalidate it
+        reset_security_review(session_id)
+        logger.info(f"[SECURITY] Session {session_id}: Security review invalidated due to code change via {tool_name}")
+
+        return {
+            "systemMessage": """## Security Review Invalidated
+
+Code was modified after the security review passed. You must run the security review again before starting the dev server.
+
+Use Task tool with `subagent_type="security-reviewer"` to re-scan the updated code.
+"""
+        }
+
+    return {}
+
+
 # Hook configuration
 HOOKS = {
     "PreToolUse": [
         HookMatcher(hooks=[log_tool_usage]),
+        # Security review required before starting dev server
+        HookMatcher(
+            matcher="mcp__e2b__sandbox_start_dev_server",
+            hooks=[require_security_review]
+        ),
     ],
     "PostToolUse": [
         HookMatcher(matcher="Bash", hooks=[validate_build_result]),
+        # Invalidate security review when code changes
+        HookMatcher(matcher="Write", hooks=[invalidate_security_review_on_code_change]),
+        HookMatcher(matcher="Edit", hooks=[invalidate_security_review_on_code_change]),
     ],
 }
 
@@ -628,6 +866,7 @@ class AppBuilderAgent:
             # E2B-specific MCP tools
             "mcp__e2b__sandbox_get_preview_url",
             "mcp__e2b__sandbox_start_dev_server",
+            "mcp__e2b__mark_security_review_passed",  # Security review confirmation
         ]
 
         # Add Keboola MCP server if configured
