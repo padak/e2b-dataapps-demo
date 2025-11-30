@@ -591,15 +591,53 @@ Agent defaultně preferuje curated jako základ, ale respektuje explicitní pož
 - `KeboolaDataSection` - kompletní data browser (picker + table)
 - `keboola.ts` - Query Service API client
 
-### Fáze 3: Keboola MCP Integration
+### Fáze 3: Keboola MCP Integration ✅ DONE
 
 **Soubory:**
+- `backend/app/integrations/__init__.py` - modul pro integrace
 - `backend/app/integrations/keboola_mcp.py` - MCP integrace
+- `scripts/test_agent_keboola_mcp.py` - integrační test
 
 **Úkoly:**
-1. Integrace Keboola MCP do Claude Agent SDK
-2. Master Token setup (automatický workspace)
-3. Hlavní tools: `list_buckets`, `list_tables`, `get_table`, `query_data`
+1. ✅ Integrace Keboola MCP do Claude Agent SDK
+2. ✅ Stdio transport konfigurace (spouští `uvx keboola_mcp_server`)
+3. ✅ Hlavní tools: `list_buckets`, `list_tables`, `get_table`, `query_data`, `search`, `get_project_info`
+
+**Implementováno:**
+
+`keboola_mcp.py` poskytuje:
+- `get_keboola_mcp_config()` - vrací stdio transport konfiguraci pro MCP server
+- `get_essential_keboola_tools()` - seznam základních tools pro data exploration
+- `is_keboola_configured()` - kontrola přítomnosti credentials
+
+`agent.py` upraveno:
+- Dynamické přidání Keboola MCP serveru do `mcp_servers` konfigurace
+- Přidání Keboola tools do `allowed_tools` pokud jsou credentials k dispozici
+
+**Workflow:**
+```
+Agent inicializace
+       │
+       ▼
+get_keboola_mcp_config()
+  - Načte KBC_URL, KBC_TOKEN z .env
+  - Vrátí stdio transport config pro uvx keboola_mcp_server
+       │
+       ▼
+ClaudeAgentOptions
+  mcp_servers: {"e2b": ..., "keboola": keboola_config}
+  allowed_tools: [..., mcp__keboola__list_buckets, ...]
+       │
+       ▼
+Agent může explorovat data přes MCP tools
+```
+
+**Test:**
+```bash
+cd /Users/padak/github/e2b-dataapps
+source .venv/bin/activate
+SANDBOX_MODE=local python scripts/test_agent_keboola_mcp.py
+```
 
 ### Fáze 4: Data Context Injection
 
@@ -781,18 +819,18 @@ Keboola workspace poskytuje Snowflake credentials:
 **Fáze 1-6: Hlavní implementace**
 1. ✅ **Domain Knowledge Prompt** - základní inteligence agenta
 2. ✅ **Curated Component Library** - konzistentní UI
-3. ⏳ **Keboola MCP Integration** - připojení k datům ← DALŠÍ
-4. ⏳ **Data Context Injection** - credentials do sandboxu
+3. ✅ **Keboola MCP Integration** - připojení k datům
+4. ⏳ **Data Context Injection** - credentials do sandboxu ← DALŠÍ
 5. ⏳ **Security Reviewer** - bezpečnostní kontrola
 6. ⏳ **Interactive Planning** - lepší dialog s uživatelem
 
-Fáze 0-2 jsou hotové, Fáze 3-4 přidají data, 5-6 vylepší bezpečnost a UX.
+Fáze 0-3 jsou hotové, Fáze 4 přidá credentials management, 5-6 vylepší bezpečnost a UX.
 
 ---
 
 ## Hotové artefakty (quick reference)
 
-### Fáze 0-2 výstupy
+### Fáze 0-3 výstupy
 
 | Artefakt | Cesta | Popis |
 |----------|-------|-------|
@@ -805,6 +843,8 @@ Fáze 0-2 jsou hotové, Fáze 3-4 přidají data, 5-6 vylepší bezpečnost a UX
 | UI primitives | `components/curated/components/ui/` | button, input, table, dropdown-menu, badge, skeleton |
 | API endpoint | `components/curated/app/api/keboola/route.ts` | Next.js API pro Keboola Query Service |
 | Test scripts | `scripts/test_keboola_*.py` | Testování Keboola připojení a MCP |
+| Keboola MCP integration | `backend/app/integrations/keboola_mcp.py` | MCP server konfigurace pro Claude Agent SDK |
+| Agent MCP test | `scripts/test_agent_keboola_mcp.py` | Test integrace MCP v agentovi |
 
 ### Testovací prostředí
 

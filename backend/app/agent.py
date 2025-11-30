@@ -44,6 +44,11 @@ from .sandbox_factory import create_sandbox_manager
 from .tools.sandbox_tools import create_sandbox_tools_server, create_e2b_only_server
 from .logging_config import get_session_logger
 from .prompts.data_platform import DATA_PLATFORM_PROMPT
+from .integrations.keboola_mcp import (
+    get_keboola_mcp_config,
+    get_essential_keboola_tools,
+    is_keboola_configured,
+)
 
 # Default model if not specified in environment
 DEFAULT_MODEL = "claude-sonnet-4-5"
@@ -608,6 +613,32 @@ class AppBuilderAgent:
         # Create minimal MCP server with only E2B-specific tools
         self.mcp_server = create_e2b_only_server(self.sandbox_manager, session_id=self.session_id)
 
+        # Build MCP servers configuration
+        mcp_servers = {
+            "e2b": self.mcp_server
+        }
+
+        # Build allowed tools list
+        allowed_tools = [
+            # Native Claude Code tools
+            "Read", "Write", "Edit",
+            "Bash",
+            "Glob", "Grep",
+            "Task",  # For spawning subagents
+            # E2B-specific MCP tools
+            "mcp__e2b__sandbox_get_preview_url",
+            "mcp__e2b__sandbox_start_dev_server",
+        ]
+
+        # Add Keboola MCP server if configured
+        keboola_config = get_keboola_mcp_config()
+        if keboola_config:
+            mcp_servers["keboola"] = keboola_config
+            allowed_tools.extend(get_essential_keboola_tools())
+            logger.info(f"[{self.session_id}] Keboola MCP enabled with {len(get_essential_keboola_tools())} tools")
+        else:
+            logger.info(f"[{self.session_id}] Keboola MCP not configured (missing credentials)")
+
         # Configure Claude Agent SDK with native tools and subagents
         options = ClaudeAgentOptions(
             # Set working directory to sandbox path - native tools will operate here
@@ -622,22 +653,11 @@ class AppBuilderAgent:
 
             model=model,
 
-            # Native tools + E2B MCP tools + Task for subagents
-            allowed_tools=[
-                # Native Claude Code tools
-                "Read", "Write", "Edit",
-                "Bash",
-                "Glob", "Grep",
-                "Task",  # For spawning subagents
-                # E2B-specific MCP tools (note: includes 'sandbox_' prefix from tool function names)
-                "mcp__e2b__sandbox_get_preview_url",
-                "mcp__e2b__sandbox_start_dev_server",
-            ],
+            # Native tools + MCP tools + Task for subagents
+            allowed_tools=allowed_tools,
 
-            # E2B MCP server for preview URL and dev server
-            mcp_servers={
-                "e2b": self.mcp_server
-            },
+            # MCP servers (E2B + Keboola if configured)
+            mcp_servers=mcp_servers,
 
             # Specialized subagents for code review, error fixing, and component generation
             agents=AGENTS,
