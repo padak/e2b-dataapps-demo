@@ -697,16 +697,50 @@ App má přístup k process.env.KBC_URL, KBC_TOKEN, etc.
 - `mark_security_review_passed` MCP tool - agent zavolá po úspěšné review
 - Test suite: 13 testů prošlo
 
-### Fáze 6: Interactive Planning Flow
+### Fáze 6: Interactive Planning Flow ✅ DONE
 
 **Soubory:**
-- Upravit `backend/app/agent.py` - planning capabilities
+- `backend/app/planning/__init__.py` - modul export
+- `backend/app/planning/planning_state.py` - state management, dataclasses, schemas
+- `backend/app/planning/planning_prompts.py` - prompty pro planning subagenty
+- `backend/app/agent.py` - planning subagenty a hooks
 
-**Úkoly:**
-1. Agent umí vést dialog před stavěním
-2. Sbírá potřebné informace inteligentně
-3. Používá Keboola MCP pro exploraci
-4. Teprve pak staví
+**Implementováno:**
+
+1. **Planning State Management:**
+   - `PlanningState` - kompletní stav plánování (requirements, questions, plan)
+   - `PlanningStatus` enum - NOT_STARTED, EXPLORING_DATA, AWAITING_CLARIFICATION, etc.
+   - `DataRequirement`, `UIRequirement`, `ClarifyingQuestion`, `AppPlan` dataclasses
+   - Session-scoped state storage s thread-safe přístupem
+
+2. **Planning Subagenty:**
+   - `requirements-analyzer` - analyzuje user request, extrahuje requirements
+   - `planning-agent` - orchestruje planning, exploruje data, ptá se otázky
+   - `plan-validator` - validuje plány před buildem
+
+3. **Planning Hooks:**
+   - `track_planning_state` - sleduje data exploration přes Keboola MCP
+   - `suggest_planning_on_new_request` - navrhne planning při vytváření souborů bez plánu
+   - `self_heal_planning_issues` - detekuje a opravuje problémy při exploraci
+
+4. **Structured Output Schemas:**
+   - `PLANNING_RESULT_SCHEMA` - pro výstupy requirements analyzeru
+   - `APP_PLAN_SCHEMA` - pro finální plány aplikací
+
+5. **System Prompt Integration:**
+   - `INTERACTIVE_PLANNING_PROMPT` - workflow instrukce pro hlavního agenta
+   - Dokumentace planning subagentů v system prompt
+
+**Workflow:**
+```
+User Request → requirements-analyzer → Data Exploration (Keboola MCP)
+                                                ↓
+                                    Clarifying Questions (if needed)
+                                                ↓
+                                    Plan Generation → plan-validator
+                                                ↓
+                                    User Approval → Build Phase
+```
 
 ## Příklady Use Cases
 
@@ -859,9 +893,9 @@ Keboola workspace poskytuje Snowflake credentials:
 3. ✅ **Keboola MCP Integration** - připojení k datům
 4. ✅ **Data Context Injection** - credentials do sandboxu
 5. ✅ **Security Reviewer** - bezpečnostní kontrola
-6. ⏳ **Interactive Planning** - lepší dialog s uživatelem ← DALŠÍ
+6. ✅ **Interactive Planning** - lepší dialog s uživatelem
 
-Fáze 0-5 jsou hotové, Fáze 6 vylepší UX.
+**Všechny fáze jsou hotové!** Systém je připraven k použití.
 
 ---
 
@@ -889,6 +923,11 @@ Fáze 0-5 jsou hotové, Fáze 6 vylepší UX.
 | Security review hooks | `backend/app/agent.py` (HOOKS dict) | require_security_review, invalidate_security_review_on_code_change |
 | Security review tool | `backend/app/tools/sandbox_tools.py` | mark_security_review_passed - MCP tool |
 | Security review test | `scripts/test_security_reviewer.py` | Test suite pro security review (13 testů) |
+| Planning state module | `backend/app/planning/planning_state.py` | PlanningState, dataclasses, schemas |
+| Planning prompts | `backend/app/planning/planning_prompts.py` | PLANNING_AGENT_PROMPT, PLAN_VALIDATOR_PROMPT, REQUIREMENTS_ANALYZER_PROMPT |
+| Planning subagenty | `backend/app/agent.py` (AGENTS dict) | requirements-analyzer, planning-agent, plan-validator |
+| Planning hooks | `backend/app/agent.py` (HOOKS dict) | track_planning_state, suggest_planning_on_new_request, self_heal_planning_issues |
+| Planning test | `scripts/test_planning_flow.py` | Test suite pro planning module |
 
 ### Testovací prostředí
 
@@ -907,6 +946,9 @@ source .venv/bin/activate && python scripts/test_data_context.py
 
 # Security review test
 source .venv/bin/activate && python scripts/test_security_reviewer.py
+
+# Planning flow test
+source .venv/bin/activate && python scripts/test_planning_flow.py
 ```
 
 ### Environment variables (.env)

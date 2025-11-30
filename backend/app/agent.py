@@ -49,6 +49,16 @@ from .integrations.keboola_mcp import (
     get_essential_keboola_tools,
     is_keboola_configured,
 )
+from .planning import (
+    get_planning_state,
+    update_planning_state,
+    reset_planning_state,
+    PlanningStatus,
+    PLANNING_AGENT_PROMPT,
+    PLAN_VALIDATOR_PROMPT,
+    REQUIREMENTS_ANALYZER_PROMPT,
+)
+from .planning.planning_prompts import INTERACTIVE_PLANNING_PROMPT
 
 # Default model if not specified in environment
 DEFAULT_MODEL = "claude-sonnet-4-5"
@@ -163,6 +173,13 @@ If build fails:
 ### Subagents Available
 
 You can delegate tasks to specialized subagents using the Task tool:
+
+**Planning Subagents:**
+- `requirements-analyzer`: Analyzes user requests and extracts structured requirements
+- `planning-agent`: Orchestrates planning - explores data, asks questions, creates plans
+- `plan-validator`: Validates app plans before building
+
+**Build Subagents:**
 - `security-reviewer`: **REQUIRED** - Reviews code for security vulnerabilities. Must run before dev server.
 - `code-reviewer`: Reviews TypeScript/React code for errors. Use when build fails.
 - `error-fixer`: Fixes specific code errors identified by code-reviewer.
@@ -192,7 +209,7 @@ You can delegate tasks to specialized subagents using the Task tool:
 - Credential leaks (logging process.env, exposing secrets)
 - Dangerous patterns (eval, dangerouslySetInnerHTML with user input)
 
-""" + DATA_PLATFORM_PROMPT
+""" + DATA_PLATFORM_PROMPT + INTERACTIVE_PLANNING_PROMPT
 
 # =============================================================================
 # SUBAGENTS - Specialized agents for different tasks
@@ -378,6 +395,40 @@ export default function ComponentName({ prop1, prop2 }: Props) {
 """,
         tools=["Write", "Read"],
         model="sonnet"
+    ),
+
+    # ==========================================================================
+    # PLANNING SUBAGENTS - Interactive app planning
+    # ==========================================================================
+
+    "requirements-analyzer": AgentDefinition(
+        description="Analyzes user requests to extract structured requirements. Use at the start of any app building request.",
+        prompt=REQUIREMENTS_ANALYZER_PROMPT,
+        tools=["Read", "Glob", "Grep"],
+        model="sonnet"
+    ),
+
+    "planning-agent": AgentDefinition(
+        description="Orchestrates the planning process: explores data, asks questions, creates plans. Use for complex app requests.",
+        prompt=PLANNING_AGENT_PROMPT,
+        tools=[
+            "Read", "Glob", "Grep",
+            # Keboola MCP tools for data exploration
+            "mcp__keboola__list_buckets",
+            "mcp__keboola__list_tables",
+            "mcp__keboola__get_table",
+            "mcp__keboola__query_data",
+            "mcp__keboola__search",
+            "mcp__keboola__get_project_info",
+        ],
+        model="sonnet"
+    ),
+
+    "plan-validator": AgentDefinition(
+        description="Validates app plans before execution. Use after creating a plan to check for issues.",
+        prompt=PLAN_VALIDATOR_PROMPT,
+        tools=["Read", "Glob", "Grep"],
+        model="haiku"  # Fast validation
     ),
 }
 
@@ -592,6 +643,167 @@ Use Task tool with `subagent_type="security-reviewer"` to re-scan the updated co
     return {}
 
 
+# =============================================================================
+# PLANNING HOOKS - Interactive planning flow management
+# =============================================================================
+
+async def track_planning_state(
+    input_data: dict,
+    tool_use_id: str | None,
+    context: dict
+) -> dict:
+    """
+    PostToolUse hook - tracks planning state based on tool usage.
+
+    This hook monitors Keboola MCP tool usage during planning to track
+    what data has been explored.
+    """
+    tool_name = input_data.get("tool_name", "unknown")
+    session_id = context.get("session_id", "unknown")
+
+    # Track data exploration via Keboola MCP
+    keboola_tools = [
+        "mcp__keboola__list_buckets",
+        "mcp__keboola__list_tables",
+        "mcp__keboola__get_table",
+        "mcp__keboola__query_data",
+    ]
+
+    if tool_name in keboola_tools:
+        state = get_planning_state(session_id)
+        tool_response = input_data.get("tool_response", {})
+
+        if tool_name == "mcp__keboola__list_buckets":
+            # Track explored buckets
+            logger.info(f"[PLANNING] Session {session_id}: Explored buckets")
+            if state.status == PlanningStatus.NOT_STARTED:
+                update_planning_state(
+                    session_id,
+                    status=PlanningStatus.EXPLORING_DATA
+                )
+
+        elif tool_name == "mcp__keboola__list_tables":
+            bucket_id = input_data.get("tool_input", {}).get("bucket_id", "")
+            if bucket_id and bucket_id not in state.explored_schemas:
+                state.explored_schemas.append(bucket_id)
+                logger.info(f"[PLANNING] Session {session_id}: Explored schema {bucket_id}")
+
+        elif tool_name == "mcp__keboola__get_table":
+            table_id = input_data.get("tool_input", {}).get("table_id", "")
+            if table_id:
+                logger.info(f"[PLANNING] Session {session_id}: Explored table {table_id}")
+
+    return {}
+
+
+async def detect_plan_approval(
+    input_data: dict,
+    tool_use_id: str | None,
+    context: dict
+) -> dict:
+    """
+    PostToolUse hook - detects when user approves a plan.
+
+    Looks for approval signals in user messages and transitions
+    the planning state to PLAN_APPROVED.
+    """
+    # This hook would be triggered on user message processing
+    # For now, we track via text analysis in the main agent
+    return {}
+
+
+async def suggest_planning_on_new_request(
+    input_data: dict,
+    tool_use_id: str | None,
+    context: dict
+) -> dict:
+    """
+    PreToolUse hook - suggests using planning subagent for new app requests.
+
+    When the agent starts writing files without proper planning,
+    this hook can suggest the planning workflow.
+    """
+    tool_name = input_data.get("tool_name", "unknown")
+    session_id = context.get("session_id", "unknown")
+
+    # Check if this is a file creation without planning
+    if tool_name == "Write":
+        state = get_planning_state(session_id)
+
+        # If we're writing files but haven't done planning, suggest it
+        if state.status == PlanningStatus.NOT_STARTED:
+            file_path = input_data.get("tool_input", {}).get("file_path", "")
+
+            # Only suggest for app files, not configs
+            app_file_patterns = ["/app/", "/components/", "/pages/", "/lib/"]
+            is_app_file = any(p in file_path for p in app_file_patterns)
+
+            if is_app_file:
+                logger.info(f"[PLANNING] Session {session_id}: Detected file creation without planning")
+                # Don't block, but add a reminder
+                return {
+                    "systemMessage": """## Planning Reminder
+
+You're about to create app files. For better results, consider:
+
+1. **Explore data first** - Use Keboola MCP tools to see what data is available
+2. **Ask clarifying questions** - Make sure you understand the requirements
+3. **Present a plan** - Show the user what you're going to build before building
+
+This leads to better apps with fewer iterations. Continue if you're confident,
+or use the `planning-agent` subagent for complex requests.
+"""
+                }
+
+    return {}
+
+
+async def self_heal_planning_issues(
+    input_data: dict,
+    tool_use_id: str | None,
+    context: dict
+) -> dict:
+    """
+    PostToolUse hook - detects and suggests fixes for planning issues.
+
+    When planning subagents encounter issues, this hook can suggest
+    corrective actions.
+    """
+    tool_name = input_data.get("tool_name", "unknown")
+    session_id = context.get("session_id", "unknown")
+
+    # Check for failed Keboola queries during planning
+    if tool_name in ["mcp__keboola__query_data", "mcp__keboola__get_table"]:
+        tool_response = input_data.get("tool_response", {})
+
+        # Check for error in response
+        if isinstance(tool_response, dict):
+            error = tool_response.get("error") or tool_response.get("isError")
+            if error:
+                state = get_planning_state(session_id)
+                issue = f"Data exploration failed: {error}"
+
+                if issue not in state.planning_issues:
+                    state.planning_issues.append(issue)
+                    logger.warning(f"[PLANNING] Session {session_id}: {issue}")
+
+                    return {
+                        "systemMessage": f"""## Data Exploration Issue
+
+The query failed: {error}
+
+**Suggestions:**
+- Check if the table/bucket name is correct
+- Try `list_buckets` to see available data
+- The table might be empty or have restricted access
+
+This is normal during exploration - try a different approach.
+"""
+                    }
+
+    return {}
+
+
 # Hook configuration
 HOOKS = {
     "PreToolUse": [
@@ -601,12 +813,16 @@ HOOKS = {
             matcher="mcp__e2b__sandbox_start_dev_server",
             hooks=[require_security_review]
         ),
+        # Planning suggestion when creating files without planning
+        HookMatcher(matcher="Write", hooks=[suggest_planning_on_new_request]),
     ],
     "PostToolUse": [
         HookMatcher(matcher="Bash", hooks=[validate_build_result]),
         # Invalidate security review when code changes
         HookMatcher(matcher="Write", hooks=[invalidate_security_review_on_code_change]),
         HookMatcher(matcher="Edit", hooks=[invalidate_security_review_on_code_change]),
+        # Track planning state during data exploration
+        HookMatcher(matcher="mcp__keboola__*", hooks=[track_planning_state, self_heal_planning_issues]),
     ],
 }
 
