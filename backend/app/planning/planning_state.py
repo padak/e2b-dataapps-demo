@@ -205,7 +205,12 @@ def get_planning_state(session_id: str) -> PlanningState:
 def update_planning_state(session_id: str, **kwargs) -> PlanningState:
     """Update specific fields of the planning state."""
     with _state_lock:
-        state = get_planning_state(session_id)
+        # Get or create state directly (don't call get_planning_state to avoid deadlock)
+        if session_id not in _planning_states:
+            _planning_states[session_id] = PlanningState(session_id=session_id)
+            logger.info(f"[PLANNING] Created new planning state for session {session_id}")
+        state = _planning_states[session_id]
+
         for key, value in kwargs.items():
             if hasattr(state, key):
                 setattr(state, key, value)

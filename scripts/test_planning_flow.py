@@ -17,10 +17,14 @@ Run:
 import sys
 import os
 
+print("[DEBUG] Setting up sys.path...")
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+print(f"[DEBUG] sys.path[0] = {sys.path[0]}")
 
-from backend.app.planning import (
+print("[DEBUG] Importing from planning_state...")
+# Import directly from submodules to avoid any potential circular imports
+from backend.app.planning.planning_state import (
     PlanningState,
     PlanningStatus,
     DataRequirement,
@@ -31,11 +35,19 @@ from backend.app.planning import (
     update_planning_state,
     reset_planning_state,
     is_planning_complete,
+    PLANNING_RESULT_SCHEMA,
+    APP_PLAN_SCHEMA,
+)
+print("[DEBUG] planning_state imported OK")
+
+print("[DEBUG] Importing from planning_prompts...")
+from backend.app.planning.planning_prompts import (
     PLANNING_AGENT_PROMPT,
     PLAN_VALIDATOR_PROMPT,
     REQUIREMENTS_ANALYZER_PROMPT,
 )
-from backend.app.planning.planning_state import PLANNING_RESULT_SCHEMA, APP_PLAN_SCHEMA
+print("[DEBUG] planning_prompts imported OK")
+print("[DEBUG] All imports done, starting tests...")
 
 
 def test_planning_state_creation():
