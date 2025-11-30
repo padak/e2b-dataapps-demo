@@ -396,20 +396,31 @@ S knihovnou:
 - Konzistence - základní patterns jsou stejné
 - Rychlost - nemusí generovat vše od nuly
 
-### Struktura knihovny
+### Struktura knihovny (aktuální stav)
 
 ```
 /components/curated/
-├── registry.json              # Seznam komponent pro agenta
+├── registry.json                    # Seznam komponent pro agenta ✅
+├── keboola.ts                       # Shared Keboola Query API client ✅
 ├── data-table/
-│   ├── DataTable.tsx          # Hlavní komponenta
-│   ├── KeboolaStoragePicker.tsx
-│   ├── usage.md               # Kdy a jak použít (agent to čte)
-│   └── index.ts               # Exporty
-├── chart-line/
-│   ├── LineChart.tsx
-│   └── usage.md
-└── keboola.ts                 # Shared Keboola Query API client
+│   ├── DataTable.tsx                # Interaktivní tabulka ✅
+│   ├── KeboolaStoragePicker.tsx     # Picker schema/table ✅
+│   ├── usage.md                     # Dokumentace DataTable ✅
+│   ├── KeboolaStoragePicker.usage.md # Dokumentace Picker ✅
+│   ├── KeboolaDataSection.usage.md  # Dokumentace DataSection ✅
+│   └── index.ts                     # Exporty
+├── app/
+│   ├── KeboolaDataSection.tsx       # Kompletní data browser ✅
+│   ├── page.tsx                     # Demo stránka
+│   └── api/keboola/route.ts         # API endpoint
+├── components/ui/                   # shadcn/ui primitives ✅
+│   ├── button.tsx
+│   ├── input.tsx
+│   ├── table.tsx
+│   ├── dropdown-menu.tsx
+│   ├── badge.tsx
+│   └── skeleton.tsx
+└── lib/utils.ts                     # Tailwind utilities
 ```
 
 ### Component Registry
@@ -562,17 +573,23 @@ Agent defaultně preferuje curated jako základ, ale respektuje explicitní pož
 - `KEBOOLA_MCP_KNOWLEDGE` - MCP tools for data exploration
 - Integrováno do `agent.py` via import
 
-### Fáze 2: Curated Component Library 🔶 IN PROGRESS
+### Fáze 2: Curated Component Library ✅ DONE
 
 **Soubory:**
 - `components/curated/` - knihovna komponent
 
 **Úkoly:**
-1. ✅ Vytvořit základní komponenty (DataTable, KeboolaStoragePicker)
+1. ✅ Vytvořit základní komponenty (DataTable, KeboolaStoragePicker, KeboolaDataSection)
 2. ✅ `keboola.ts` používá Query Service API (ne přímý Snowflake)
-3. ⏳ Napsat usage.md pro komponenty
-4. ⏳ Aktualizovat registr komponent (`components.json`)
+3. ✅ Napsat usage.md pro komponenty
+4. ✅ Vytvořit `registry.json` - seznam komponent pro agenta
 5. ~~Automatická injekce do sandboxu~~ → N/A (lokální mode, agent kopíruje sám)
+
+**Komponenty:**
+- `DataTable` - interaktivní tabulka (sorting, filtering, pagination)
+- `KeboolaStoragePicker` - dropdown pro výběr schema/table
+- `KeboolaDataSection` - kompletní data browser (picker + table)
+- `keboola.ts` - Query Service API client
 
 ### Fáze 3: Keboola MCP Integration
 
@@ -665,7 +682,7 @@ keboola-query-service>=0.1.1    # Keboola Query Service SDK
 
 **Poznámka:** Nepotřebujeme přímé Snowflake připojení - vše jde přes Keboola Query Service API.
 
-## Fáze 0: Setup & Explorace (PRE-DEVEL)
+## Fáze 0: Setup & Explorace ✅ DONE
 
 Praktická příprava před hlavní implementací - ověření že všechno funguje.
 
@@ -755,18 +772,63 @@ Keboola workspace poskytuje Snowflake credentials:
 
 ## Pořadí implementace
 
-**Fáze 0: Setup & Explorace** ← NOVÁ (teď)
-0. Ověření Keboola připojení
-1. Vyzkoušení Keboola MCP
-2. První UI komponenta (DataTable)
-3. Snowflake credentials workflow
+**Fáze 0: Setup & Explorace** ✅ DONE
+- ✅ Ověření Keboola připojení
+- ✅ Vyzkoušení Keboola MCP
+- ✅ První UI komponenta (DataTable)
+- ✅ Query Service API workflow (ne přímé Snowflake)
 
-**Fáze 1-6: Hlavní implementace** (po Fázi 0)
-1. **Domain Knowledge Prompt** - základní inteligence agenta
-2. **Curated Component Library** - konzistentní UI
-3. **Keboola MCP Integration** - připojení k datům
-4. **Data Context Injection** - credentials do sandboxu
-5. **Security Reviewer** - bezpečnostní kontrola
-6. **Interactive Planning** - lepší dialog s uživatelem
+**Fáze 1-6: Hlavní implementace**
+1. ✅ **Domain Knowledge Prompt** - základní inteligence agenta
+2. ✅ **Curated Component Library** - konzistentní UI
+3. ⏳ **Keboola MCP Integration** - připojení k datům ← DALŠÍ
+4. ⏳ **Data Context Injection** - credentials do sandboxu
+5. ⏳ **Security Reviewer** - bezpečnostní kontrola
+6. ⏳ **Interactive Planning** - lepší dialog s uživatelem
 
-Fáze 0 je praktická příprava, Fáze 1-2 jsou základ, 3-4 přidají data, 5-6 vylepší bezpečnost a UX.
+Fáze 0-2 jsou hotové, Fáze 3-4 přidají data, 5-6 vylepší bezpečnost a UX.
+
+---
+
+## Hotové artefakty (quick reference)
+
+### Fáze 0-2 výstupy
+
+| Artefakt | Cesta | Popis |
+|----------|-------|-------|
+| Domain knowledge prompt | `backend/app/prompts/data_platform.py` | DATA_PLATFORM_KNOWLEDGE, CURATED_COMPONENTS_KNOWLEDGE, KEBOOLA_MCP_KNOWLEDGE |
+| DataTable komponenta | `components/curated/data-table/DataTable.tsx` | Interaktivní tabulka s sorting, filtering, pagination |
+| KeboolaStoragePicker | `components/curated/data-table/KeboolaStoragePicker.tsx` | Dropdown pro výběr schema/table |
+| KeboolaDataSection | `components/curated/app/KeboolaDataSection.tsx` | Kompletní data browser (picker + table) |
+| Keboola Query client | `components/curated/keboola.ts` | queryData(), listSchemas(), listTables() |
+| Component registry | `components/curated/registry.json` | Seznam komponent pro agenta |
+| UI primitives | `components/curated/components/ui/` | button, input, table, dropdown-menu, badge, skeleton |
+| API endpoint | `components/curated/app/api/keboola/route.ts` | Next.js API pro Keboola Query Service |
+| Test scripts | `scripts/test_keboola_*.py` | Testování Keboola připojení a MCP |
+
+### Testovací prostředí
+
+```bash
+# Curated components demo (port 3333)
+cd components/curated && npm run dev
+
+# Keboola connection test
+cd scripts && python test_keboola_connection.py
+
+# Keboola MCP test
+cd scripts && python test_keboola_mcp.py
+```
+
+### Environment variables (.env)
+
+```bash
+# Pro Query Service API (runtime apps)
+KBC_URL=https://connection.keboola.com/
+KBC_TOKEN=your-storage-api-token
+WORKSPACE_ID=123456
+BRANCH_ID=789
+
+# Pro Keboola MCP (design/exploration)
+KBC_STORAGE_API_URL=https://connection.keboola.com
+KBC_STORAGE_TOKEN=your-master-token
+```

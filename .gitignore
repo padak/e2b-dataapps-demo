@@ -31,3 +31,12 @@ logs/
 # Frontend
 frontend/node_modules/
 frontend/dist/
+
+# Root level npm (should not exist - this is a Python project)
+/node_modules/
+/package.json
+/package-lock.json
+
+# Curated components build artifacts
+components/curated/.next/
+components/curated/node_modules/

@@ -1,0 +1,156 @@
+{
+  "$schema": "./registry.schema.json",
+  "version": "1.0.0",
+  "description": "Curated component library for Keboola data apps",
+  "components": [
+    {
+      "name": "DataTable",
+      "path": "data-table/DataTable.tsx",
+      "usagePath": "data-table/usage.md",
+      "description": "Interactive data table with sorting, filtering, pagination, column visibility",
+      "useWhen": [
+        "display tabular data",
+        "show query results",
+        "data exploration",
+        "CRUD interface",
+        "list items or records",
+        "show sample data"
+      ],
+      "features": [
+        "Auto-generated columns from data",
+        "Global search across all columns",
+        "Column sorting (click headers)",
+        "Pagination with configurable page size",
+        "Column visibility toggle",
+        "Expandable truncated cells",
+        "Loading skeleton state",
+        "Empty state message",
+        "Smart cell rendering (numbers, booleans, JSON, dates)"
+      ],
+      "props": {
+        "data": "T[] - Array of data objects (required)",
+        "columns": "ColumnDef<T>[] - Custom columns (optional, auto-generated if omitted)",
+        "searchable": "boolean - Enable search (default: true)",
+        "paginated": "boolean - Enable pagination (default: true)",
+        "pageSize": "number - Rows per page (default: 10)",
+        "sortable": "boolean - Enable sorting (default: true)",
+        "columnToggle": "boolean - Enable column visibility toggle (default: true)",
+        "title": "string - Table title",
+        "description": "string - Table description",
+        "loading": "boolean - Show loading state",
+        "emptyMessage": "string - Message when no data"
+      },
+      "dependencies": ["@tanstack/react-table", "lucide-react"]
+    },
+    {
+      "name": "KeboolaStoragePicker",
+      "path": "data-table/KeboolaStoragePicker.tsx",
+      "usagePath": "data-table/KeboolaStoragePicker.usage.md",
+      "description": "Dropdown picker for selecting Keboola schemas and tables",
+      "useWhen": [
+        "user needs to select Keboola table",
+        "data source selection",
+        "storage browser",
+        "pick a dataset",
+        "choose table to display"
+      ],
+      "features": [
+        "Two-step selection (schema then table)",
+        "Connection status indicator",
+        "Loading spinner",
+        "Refresh button",
+        "Scrollable dropdown for many items"
+      ],
+      "props": {
+        "schemas": "string[] - List of schemas (required)",
+        "tables": "string[] - List of tables in selected schema (required)",
+        "selectedSchema": "string | null - Current schema",
+        "selectedTable": "string | null - Current table",
+        "loading": "boolean - Loading state",
+        "onSchemaChange": "(schema: string) => void - Schema change handler",
+        "onTableChange": "(table: string) => void - Table change handler",
+        "onRefresh": "() => void - Refresh handler (optional)"
+      },
+      "dependencies": ["lucide-react"]
+    },
+    {
+      "name": "KeboolaDataSection",
+      "path": "app/KeboolaDataSection.tsx",
+      "usagePath": "data-table/KeboolaDataSection.usage.md",
+      "description": "Complete data browser combining picker and table - zero config",
+      "useWhen": [
+        "data browser",
+        "data explorer",
+        "browse Keboola data",
+        "explore tables",
+        "view data from Keboola",
+        "quick data access"
+      ],
+      "features": [
+        "All-in-one picker + table",
+        "Preloads all schemas and tables",
+        "Instant schema/table switching",
+        "Configurable row limits (100-5000)",
+        "Graceful fallback with sample data",
+        "Clear error handling",
+        "Empty state guidance"
+      ],
+      "props": "none - self-contained component",
+      "dependencies": ["DataTable", "KeboolaStoragePicker"],
+      "requiresApi": "/api/keboola"
+    }
+  ],
+  "shared": [
+    {
+      "name": "keboola",
+      "path": "keboola.ts",
+      "description": "Keboola Query Service client for data fetching",
+      "exports": ["queryData", "listSchemas", "listTables", "Client", "JobError"],
+      "envRequired": ["KBC_URL", "KBC_TOKEN", "WORKSPACE_ID", "BRANCH_ID"]
+    }
+  ],
+  "uiPrimitives": [
+    {
+      "name": "button",
+      "path": "components/ui/button.tsx",
+      "description": "Button with variants: default, outline, ghost, destructive"
+    },
+    {
+      "name": "input",
+      "path": "components/ui/input.tsx",
+      "description": "Text input field"
+    },
+    {
+      "name": "table",
+      "path": "components/ui/table.tsx",
+      "description": "Base table components: Table, TableHeader, TableBody, TableRow, TableCell"
+    },
+    {
+      "name": "dropdown-menu",
+      "path": "components/ui/dropdown-menu.tsx",
+      "description": "Dropdown menu with items, checkboxes, submenus"
+    },
+    {
+      "name": "badge",
+      "path": "components/ui/badge.tsx",
+      "description": "Badge/tag component with variants"
+    },
+    {
+      "name": "skeleton",
+      "path": "components/ui/skeleton.tsx",
+      "description": "Loading skeleton placeholder"
+    }
+  ],
+  "styling": {
+    "framework": "Tailwind CSS",
+    "designSystem": "shadcn/ui (New York style)",
+    "colorScheme": "neutral",
+    "cssVariables": true,
+    "darkMode": "class"
+  },
+  "usage": {
+    "install": "Copy components to your project, install dependencies",
+    "import": "Import from @/components/curated/... or copy to @/components/",
+    "customize": "Components are boilerplate - modify as needed"
+  }
+}
