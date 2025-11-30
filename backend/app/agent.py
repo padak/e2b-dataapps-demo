@@ -43,6 +43,7 @@ from claude_agent_sdk import (
 from .sandbox_factory import create_sandbox_manager
 from .tools.sandbox_tools import create_sandbox_tools_server, create_e2b_only_server
 from .logging_config import get_session_logger
+from .prompts.data_platform import DATA_PLATFORM_PROMPT
 
 # Default model if not specified in environment
 DEFAULT_MODEL = "claude-sonnet-4-5"
@@ -160,7 +161,8 @@ You can delegate tasks to specialized subagents using the Task tool:
 - `code-reviewer`: Reviews TypeScript/React code for errors. Use when build fails.
 - `error-fixer`: Fixes specific code errors identified by code-reviewer.
 - `component-generator`: Generates React components with TypeScript and Tailwind.
-"""
+
+""" + DATA_PLATFORM_PROMPT
 
 # =============================================================================
 # SUBAGENTS - Specialized agents for different tasks

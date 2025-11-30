@@ -495,16 +495,22 @@ Agent defaultně preferuje curated jako základ, ale respektuje explicitní pož
 
 ## Implementační fáze
 
-### Fáze 1: Domain Knowledge System Prompt
+### Fáze 1: Domain Knowledge System Prompt ✅ DONE
 
 **Soubory:**
-- `backend/app/prompts/data_platform.py` - doménové znalosti
+- `backend/app/prompts/data_platform.py` - doménové znalosti ✅
 
 **Úkoly:**
-1. Napsat obsáhlý system prompt s doménovými znalostmi
-2. Zahrnout Keboola specifika
-3. Zahrnout data engineering patterns
-4. Definovat jak agent přemýšlí a ptá se
+1. ✅ Napsat obsáhlý system prompt s doménovými znalostmi
+2. ✅ Zahrnout Keboola specifika
+3. ✅ Zahrnout data engineering patterns
+4. ✅ Definovat jak agent přemýšlí a ptá se
+
+**Implementováno:**
+- `DATA_PLATFORM_KNOWLEDGE` - data engineering concepts, Keboola platform
+- `CURATED_COMPONENTS_KNOWLEDGE` - component library usage
+- `KEBOOLA_MCP_KNOWLEDGE` - MCP tools for data exploration
+- Integrováno do `agent.py` via import
 
 ### Fáze 2: Curated Component Library
 
@@ -686,12 +692,12 @@ Keboola workspace poskytuje Snowflake credentials:
 
 ### Checklist Fáze 0
 
-- [ ] Query Service API funguje (existující .env)
-- [ ] Keboola MCP server běží a odpovídá
-- [ ] MCP tools fungují (list_buckets, list_tables, query_data)
-- [ ] Máme Snowflake credentials z workspace
-- [ ] DataTable komponenta je hotová a otestovaná
-- [ ] Testovací Next.js app se připojí na data
+- [x] Query Service API funguje (existující .env) ✅ `scripts/test_keboola_connection.py`
+- [x] Keboola MCP server běží a odpovídá ✅ `scripts/test_keboola_mcp.py`
+- [x] MCP tools fungují (list_buckets, list_tables, query_data) ✅ 33 tools available
+- [x] ~~Máme Snowflake credentials z workspace~~ → Query Service API (nepotřebujeme přímé Snowflake credentials)
+- [x] DataTable komponenta je hotová a otestovaná ✅ `components/curated/data-table/`
+- [x] Testovací Next.js app se připojí na data ✅ `components/curated/` (port 3333)
 
 ---
 
