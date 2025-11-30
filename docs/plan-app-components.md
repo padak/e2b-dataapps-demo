@@ -310,36 +310,172 @@ Agent se zeptá relevantní otázky, ne generické "jaká data chcete použít?"
 
 ### Princip
 
-Máme knihovnu **odladěných UI komponent** pro časté patterny.
-Agent je použije automaticky místo generování random řešení.
+Máme knihovnu **odladěných UI komponent** jako **funkční boilerplate**.
+Agent je použije jako základ a může je upravit podle potřeby uživatele.
 
 ```
 User: "Ukaž mi sample dat z tabulky customers"
 
 Bez knihovny:
-→ Agent vygeneruje nějakou tabulku, pokaždé jinak
+→ Agent vygeneruje nějakou tabulku, pokaždé jinak, často s bugy
 
 S knihovnou:
-→ Agent použije náš DataTable komponent, vždy stejný look & feel
+→ Agent zkopíruje DataTable jako boilerplate
+→ Má funkční základ, může upravit pro specifické potřeby
+→ Konzistentní look & feel, otestovaný kód
 ```
+
+### Komponenty jako Boilerplate (ne rigid library)
+
+**Klíčový princip:** Agent dostane hotovou, funkční komponentu a může si ji upravit.
+
+```
+1. Agent ví že existuje DataTable komponenta
+2. Agent ji zkopíruje do sandboxu jako základ
+3. Agent může:
+   - Použít as-is (nejčastější případ)
+   - Upravit props, přidat sloupce
+   - Změnit styling
+   - Rozšířit funkcionalitu
+4. Výsledek je vždy funkční, protože začal z funkčního základu
+```
+
+**Výhody:**
+- Žádné "vymýšlení kola" - agent má ověřený kód
+- Flexibilita - úpravy podle potřeby
+- Konzistence - základní patterns jsou stejné
+- Rychlost - nemusí generovat vše od nuly
 
 ### Struktura knihovny
 
 ```
 /components/curated/
+├── registry.json              # Seznam komponent pro agenta
 ├── data-table/
-│   ├── DataTable.tsx       # Odladěná komponenta
-│   ├── usage.md            # Kdy a jak použít
-│   └── example.tsx         # Příklad použití
+│   ├── DataTable.tsx          # Hlavní komponenta
+│   ├── KeboolaStoragePicker.tsx
+│   ├── usage.md               # Kdy a jak použít (agent to čte)
+│   └── index.ts               # Exporty
 ├── chart-line/
 │   ├── LineChart.tsx
-│   ├── usage.md
-│   └── example.tsx
-├── data-preview/
-│   ├── DataPreview.tsx     # Pro "ukaž sample"
-│   ├── usage.md
-│   └── example.tsx
-└── ...
+│   └── usage.md
+└── keboola.ts                 # Shared Keboola Query API client
+```
+
+### Component Registry
+
+Agent potřebuje vědět jaké komponenty má k dispozici:
+
+**`registry.json`:**
+```json
+{
+  "components": [
+    {
+      "name": "DataTable",
+      "path": "data-table/DataTable.tsx",
+      "description": "Interactive data table with sorting, filtering, pagination, column visibility",
+      "useWhen": [
+        "display tabular data",
+        "show query results",
+        "data exploration",
+        "CRUD interface"
+      ],
+      "features": [
+        "Auto-generated columns from data",
+        "Global search",
+        "Column sorting",
+        "Pagination with configurable page size",
+        "Column visibility toggle",
+        "Expandable truncated cells",
+        "Loading skeleton"
+      ],
+      "dependencies": ["@tanstack/react-table", "lucide-react"]
+    },
+    {
+      "name": "KeboolaStoragePicker",
+      "path": "data-table/KeboolaStoragePicker.tsx",
+      "description": "Schema and table picker for Keboola storage with instant navigation",
+      "useWhen": [
+        "user needs to select Keboola table",
+        "data source selection",
+        "storage browser"
+      ],
+      "features": [
+        "Preloads all schemas and tables",
+        "Instant schema/table switching",
+        "Loading indicator",
+        "Connection status"
+      ]
+    }
+  ],
+  "shared": [
+    {
+      "name": "keboola",
+      "path": "keboola.ts",
+      "description": "Keboola Query API client for data fetching",
+      "exports": ["queryData", "listSchemas", "listTables"]
+    }
+  ],
+  "uiPrimitives": [
+    "components/ui/button.tsx",
+    "components/ui/input.tsx",
+    "components/ui/table.tsx",
+    "components/ui/dropdown-menu.tsx",
+    "components/ui/badge.tsx",
+    "components/ui/skeleton.tsx"
+  ]
+}
+```
+
+### Agent Workflow
+
+```
+1. User: "Chci aplikaci na prohlížení dat z Keboola"
+
+2. Agent čte registry.json:
+   → Vidí DataTable + KeboolaStoragePicker
+   → Čte jejich usage.md pro detaily
+
+3. Agent vytváří sandbox:
+   → Zkopíruje komponenty do sandboxu
+   → Zkopíruje shared utilities (keboola.ts)
+   → Zkopíruje UI primitives
+
+4. Agent generuje app:
+   → Import z lokálních souborů (ne npm)
+   → Může upravit komponenty podle potřeby
+   → Propojí s Keboola credentials z env
+
+5. Výsledek:
+   → Funkční app postavená na ověřených komponentách
+   → Konzistentní UX
+   → Agent strávil čas logikou, ne UI bugfixing
+```
+
+### Injekce do Sandboxu
+
+Při vytváření nové aplikace:
+
+```python
+# Backend při vytváření sandboxu
+def setup_sandbox(sandbox_path: str):
+    # 1. Zkopírovat curated komponenty
+    shutil.copytree(
+        "components/curated/",
+        f"{sandbox_path}/components/curated/"
+    )
+
+    # 2. Zkopírovat UI primitives
+    shutil.copytree(
+        "components/curated/components/ui/",
+        f"{sandbox_path}/components/ui/"
+    )
+
+    # 3. Zkopírovat shared utilities
+    shutil.copy(
+        "components/curated/lib/utils.ts",
+        f"{sandbox_path}/lib/utils.ts"
+    )
 ```
 
 ### Verzování
@@ -353,8 +489,9 @@ S knihovnou:
 User může říct:
 - "Použij jinou knihovnu na tabulky" → Agent nepoužije curated
 - "Chci vlastní design" → Agent vygeneruje custom
+- "Uprav tabulku aby měla X" → Agent upraví zkopírovanou komponentu
 
-Agent defaultně preferuje curated, ale respektuje explicitní požadavky.
+Agent defaultně preferuje curated jako základ, ale respektuje explicitní požadavky.
 
 ## Implementační fáze
 
