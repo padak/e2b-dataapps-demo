@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from .logging_config import get_session_logger
+from .context.data_context import DataContext, inject_credentials_to_env
 
 logger = logging.getLogger(__name__)
 
@@ -426,6 +427,34 @@ class LocalSandboxManager:
             finally:
                 self._dev_server_process = None
 
+    async def _inject_credentials(self, work_dir: Path) -> bool:
+        """Inject Keboola credentials into the sandbox as .env.local file.
+
+        This creates a .env.local file in the project directory with Keboola
+        Query Service credentials. Next.js automatically loads this file.
+
+        Args:
+            work_dir: The project directory where .env.local will be created
+
+        Returns:
+            bool: True if credentials were injected, False if not available
+        """
+        try:
+            context = DataContext()
+
+            if not context.has_keboola_credentials:
+                logger.info(f"[{self._session_id}] No Keboola credentials to inject")
+                return False
+
+            credentials = context.keboola_credentials
+            inject_credentials_to_env(work_dir, credentials)
+            logger.info(f"[{self._session_id}] Keboola credentials injected to {work_dir}/.env.local")
+            return True
+
+        except Exception as e:
+            logger.warning(f"[{self._session_id}] Failed to inject credentials: {e}")
+            return False
+
     async def _health_check(self, url: str, timeout: float = 30.0, interval: float = 1.0) -> bool:
         """Check if server is healthy with HTTP probe (H5 fix).
 
@@ -485,6 +514,9 @@ class LocalSandboxManager:
 
             # Escape work_dir for shell safety (M6 fix)
             safe_work_dir = shlex.quote(str(work_dir))
+
+            # Inject Keboola credentials if available (Phase 4: Data Context)
+            await self._inject_credentials(work_dir)
 
             # Start dev server in background with process group (M9 fix)
             command = f"PORT={server_port} npm run dev"

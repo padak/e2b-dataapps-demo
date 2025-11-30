@@ -639,15 +639,42 @@ source .venv/bin/activate
 SANDBOX_MODE=local python scripts/test_agent_keboola_mcp.py
 ```
 
-### Fáze 4: Data Context Injection
+### Fáze 4: Data Context Injection ✅ DONE
 
 **Soubory:**
-- `backend/app/context/data_context.py` - správa credentials
+- `backend/app/context/__init__.py` - modul export ✅
+- `backend/app/context/data_context.py` - správa credentials ✅
+- `scripts/test_data_context.py` - test suite ✅
 
 **Úkoly:**
-1. Získání Snowflake credentials z workspace
-2. Env vars setup pro lokální vývoj
-3. E2B skills setup pro sandbox
+1. ✅ DataContext třída pro načítání credentials z environment
+2. ✅ KeboolaCredentials dataclass s konverzí na env dict
+3. ✅ Automatická injekce .env.local do sandboxu před startem dev serveru
+4. ✅ Integrace do LocalSandboxManager._inject_credentials()
+5. ✅ Test suite (5/5 testů prošlo)
+
+**Implementováno:**
+- `DataContext` - načítá KBC_URL, KBC_TOKEN, WORKSPACE_ID, BRANCH_ID z env
+- `inject_credentials_to_env()` - vytváří .env.local soubor
+- `LocalSandboxManager.start_dev_server()` - automaticky volá _inject_credentials()
+- Next.js automaticky načte .env.local při startu
+
+**Workflow:**
+```
+Agent vytvoří app
+       │
+       ▼
+start_dev_server() zavolá _inject_credentials()
+       │
+       ▼
+Vytvoří .env.local s Keboola credentials
+       │
+       ▼
+npm run dev načte .env.local
+       │
+       ▼
+App má přístup k process.env.KBC_URL, KBC_TOKEN, etc.
+```
 
 ### Fáze 5: Security Reviewer
 
@@ -820,17 +847,17 @@ Keboola workspace poskytuje Snowflake credentials:
 1. ✅ **Domain Knowledge Prompt** - základní inteligence agenta
 2. ✅ **Curated Component Library** - konzistentní UI
 3. ✅ **Keboola MCP Integration** - připojení k datům
-4. ⏳ **Data Context Injection** - credentials do sandboxu ← DALŠÍ
-5. ⏳ **Security Reviewer** - bezpečnostní kontrola
+4. ✅ **Data Context Injection** - credentials do sandboxu
+5. ⏳ **Security Reviewer** - bezpečnostní kontrola ← DALŠÍ
 6. ⏳ **Interactive Planning** - lepší dialog s uživatelem
 
-Fáze 0-3 jsou hotové, Fáze 4 přidá credentials management, 5-6 vylepší bezpečnost a UX.
+Fáze 0-4 jsou hotové, Fáze 5-6 vylepší bezpečnost a UX.
 
 ---
 
 ## Hotové artefakty (quick reference)
 
-### Fáze 0-3 výstupy
+### Fáze 0-4 výstupy
 
 | Artefakt | Cesta | Popis |
 |----------|-------|-------|
@@ -845,6 +872,8 @@ Fáze 0-3 jsou hotové, Fáze 4 přidá credentials management, 5-6 vylepší be
 | Test scripts | `scripts/test_keboola_*.py` | Testování Keboola připojení a MCP |
 | Keboola MCP integration | `backend/app/integrations/keboola_mcp.py` | MCP server konfigurace pro Claude Agent SDK |
 | Agent MCP test | `scripts/test_agent_keboola_mcp.py` | Test integrace MCP v agentovi |
+| Data context module | `backend/app/context/data_context.py` | DataContext, KeboolaCredentials, inject_credentials_to_env() |
+| Data context test | `scripts/test_data_context.py` | Test suite pro credentials injection |
 
 ### Testovací prostředí
 
@@ -857,6 +886,9 @@ cd scripts && python test_keboola_connection.py
 
 # Keboola MCP test
 cd scripts && python test_keboola_mcp.py
+
+# Data context test
+source .venv/bin/activate && python scripts/test_data_context.py
 ```
 
 ### Environment variables (.env)

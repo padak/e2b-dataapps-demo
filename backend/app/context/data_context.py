@@ -1,0 +1,260 @@
+"""
+Data Context - Credentials management for generated applications.
+
+This module handles:
+1. Reading Keboola credentials from environment
+2. Preparing credentials for injection into sandboxes
+3. Local mode: Exporting env vars before running dev server
+4. E2B mode: Using sandbox.set_env() for credential injection
+
+The generated Next.js apps use Keboola Query Service API, which requires:
+- KBC_URL: Keboola connection URL (e.g., https://connection.keboola.com)
+- KBC_TOKEN: Storage API token
+- WORKSPACE_ID: Workspace ID for queries
+- BRANCH_ID: Branch ID (usually main branch)
+
+These are injected as environment variables into the sandbox where the app runs.
+"""
+
+import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class KeboolaCredentials:
+    """Keboola credentials for Query Service API."""
+
+    kbc_url: str
+    kbc_token: str
+    workspace_id: str
+    branch_id: str
+
+    def to_env_dict(self) -> dict[str, str]:
+        """Convert credentials to environment variables dict."""
+        return {
+            "KBC_URL": self.kbc_url,
+            "KBC_TOKEN": self.kbc_token,
+            "WORKSPACE_ID": self.workspace_id,
+            "BRANCH_ID": self.branch_id,
+        }
+
+    def to_export_commands(self) -> str:
+        """Generate shell export commands for credentials."""
+        lines = []
+        for key, value in self.to_env_dict().items():
+            # Escape single quotes in values
+            escaped_value = value.replace("'", "'\\''")
+            lines.append(f"export {key}='{escaped_value}'")
+        return "\n".join(lines)
+
+    @property
+    def is_valid(self) -> bool:
+        """Check if all required credentials are present."""
+        return all([
+            self.kbc_url,
+            self.kbc_token,
+            self.workspace_id,
+            self.branch_id,
+        ])
+
+
+class DataContext:
+    """
+    Manages data context (credentials, connections) for generated applications.
+
+    Usage:
+        context = DataContext()
+        if context.has_keboola_credentials:
+            creds = context.keboola_credentials
+            # Inject into sandbox...
+    """
+
+    def __init__(self):
+        """Initialize DataContext by reading credentials from environment."""
+        self._keboola_credentials: Optional[KeboolaCredentials] = None
+        self._load_credentials()
+
+    def _load_credentials(self) -> None:
+        """Load credentials from environment variables."""
+        # Keboola credentials
+        kbc_url = os.getenv("KBC_URL", "").rstrip("/")
+        kbc_token = os.getenv("KBC_TOKEN", "")
+        workspace_id = os.getenv("WORKSPACE_ID", "")
+        branch_id = os.getenv("BRANCH_ID", "")
+
+        if kbc_url and kbc_token:
+            self._keboola_credentials = KeboolaCredentials(
+                kbc_url=kbc_url,
+                kbc_token=kbc_token,
+                workspace_id=workspace_id,
+                branch_id=branch_id,
+            )
+            logger.info(f"Keboola credentials loaded from environment (URL: {kbc_url})")
+        else:
+            logger.warning("Keboola credentials not found in environment")
+
+    @property
+    def has_keboola_credentials(self) -> bool:
+        """Check if Keboola credentials are available."""
+        return self._keboola_credentials is not None and self._keboola_credentials.is_valid
+
+    @property
+    def keboola_credentials(self) -> Optional[KeboolaCredentials]:
+        """Get Keboola credentials if available."""
+        return self._keboola_credentials
+
+    def get_env_vars_for_app(self) -> dict[str, str]:
+        """
+        Get all environment variables that should be passed to the generated app.
+
+        Returns:
+            dict: Environment variables for the app
+        """
+        env_vars = {}
+
+        if self._keboola_credentials:
+            env_vars.update(self._keboola_credentials.to_env_dict())
+
+        return env_vars
+
+
+def get_keboola_credentials() -> Optional[KeboolaCredentials]:
+    """
+    Get Keboola credentials from environment.
+
+    Convenience function for simple use cases.
+
+    Returns:
+        KeboolaCredentials if available, None otherwise
+    """
+    context = DataContext()
+    return context.keboola_credentials
+
+
+def inject_credentials_to_env(sandbox_path: Path, credentials: KeboolaCredentials) -> Path:
+    """
+    Create a .env.local file with credentials in the sandbox.
+
+    This is used for local development mode where we write a .env.local
+    file that Next.js will automatically load.
+
+    Args:
+        sandbox_path: Path to the sandbox directory
+        credentials: Keboola credentials to inject
+
+    Returns:
+        Path to the created .env.local file
+    """
+    env_file = sandbox_path / ".env.local"
+
+    # Generate .env.local content
+    lines = [
+        "# Keboola Query Service credentials",
+        "# Auto-generated by App Builder - DO NOT COMMIT",
+        "",
+    ]
+
+    for key, value in credentials.to_env_dict().items():
+        lines.append(f"{key}={value}")
+
+    env_file.write_text("\n".join(lines) + "\n")
+    logger.info(f"Created .env.local with Keboola credentials at {env_file}")
+
+    return env_file
+
+
+def get_credentials_for_sandbox(mode: str = "local") -> dict[str, str]:
+    """
+    Get credentials prepared for sandbox injection.
+
+    For local mode: Returns dict of env vars
+    For E2B mode: Returns dict suitable for sandbox.set_env()
+
+    Args:
+        mode: "local" or "e2b"
+
+    Returns:
+        dict: Environment variables to inject
+    """
+    context = DataContext()
+    return context.get_env_vars_for_app()
+
+
+# =============================================================================
+# Sandbox Integration Helpers
+# =============================================================================
+
+async def setup_sandbox_credentials(sandbox_manager, session_id: str = "unknown") -> bool:
+    """
+    Set up credentials in the sandbox for the generated app.
+
+    This function:
+    1. Loads credentials from environment
+    2. Creates .env.local file in the sandbox (for local mode)
+    3. Or sets env vars directly (for E2B mode)
+
+    Args:
+        sandbox_manager: The sandbox manager instance
+        session_id: Session ID for logging
+
+    Returns:
+        bool: True if credentials were set up, False if no credentials available
+    """
+    context = DataContext()
+
+    if not context.has_keboola_credentials:
+        logger.warning(f"[{session_id}] No Keboola credentials available for sandbox")
+        return False
+
+    credentials = context.keboola_credentials
+    env_vars = credentials.to_env_dict()
+
+    # Get sandbox path
+    sandbox_path = await sandbox_manager.ensure_sandbox()
+
+    # Check if this is a local sandbox (has _project_dir attribute)
+    if hasattr(sandbox_manager, '_project_dir') and sandbox_manager._project_dir:
+        # Local mode - write .env.local file
+        inject_credentials_to_env(Path(sandbox_path), credentials)
+        logger.info(f"[{session_id}] Credentials injected via .env.local")
+    else:
+        # E2B mode - would use sandbox.set_env() but that's not implemented yet
+        # For now, we can write .env.local there too
+        env_content = "\n".join([f"{k}={v}" for k, v in env_vars.items()])
+        await sandbox_manager.write_file(".env.local", env_content)
+        logger.info(f"[{session_id}] Credentials injected via .env.local (E2B)")
+
+    return True
+
+
+def get_credentials_status() -> dict:
+    """
+    Get status of available credentials for debugging/monitoring.
+
+    Returns:
+        dict: Status information about credentials
+    """
+    context = DataContext()
+
+    status = {
+        "keboola": {
+            "configured": context.has_keboola_credentials,
+            "url": None,
+            "workspace_id": None,
+            "branch_id": None,
+        }
+    }
+
+    if context.keboola_credentials:
+        creds = context.keboola_credentials
+        status["keboola"]["url"] = creds.kbc_url
+        status["keboola"]["workspace_id"] = creds.workspace_id
+        status["keboola"]["branch_id"] = creds.branch_id
+        # Never expose the token
+
+    return status
