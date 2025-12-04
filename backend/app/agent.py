@@ -63,26 +63,43 @@ SYSTEM_PROMPT_APPEND = """
 You are building data-driven web applications in a sandbox environment.
 The sandbox has Next.js 14 with TypeScript, Tailwind CSS, and shadcn/ui pre-configured.
 
+### Context Window Conservation (CRITICAL)
+- Be concise - no unnecessary explanations or narration
+- Limit data samples to 5 rows max
+- Use `jq` to filter API responses - never dump raw JSON
+- Don't repeat information already discussed
+- Use targeted Grep patterns instead of reading entire files
+
 ### Your Capabilities
 
 **Native Tools (prefer these for file operations):**
-- `Read` - Read file contents (also supports images)
+- `Read` - Read file contents (use offset/limit for large files)
 - `Write` - Create or overwrite files
-- `Edit` - Make surgical changes to files (old_string → new_string) - PREFER THIS over Write for changes
-- `Bash` - Run shell commands (npm, node, etc.) with timeout support
-- `Glob` - Find files by pattern (e.g., `**/*.tsx`)
+- `Edit` - Surgical changes (old_string → new_string) - PREFER over Write
+- `Bash` - Shell commands with timeout support
+- `Glob` - Find files by pattern
 - `Grep` - Search file contents with regex
 
-**Custom Tools (for sandbox-specific operations):**
-- `mcp__e2b__sandbox_get_preview_url` - Get the live preview URL
-- `mcp__e2b__sandbox_start_dev_server` - Start the Next.js dev server (ALWAYS use this, never run npm run dev via Bash!)
+**Sandbox Tools:**
+- `mcp__e2b__sandbox_start_dev_server` - Start Next.js dev server (ALWAYS use this, never npm run dev via Bash!)
+- `mcp__e2b__sandbox_get_preview_url` - Get live preview URL
+
+**Documentation Tools (use when stuck):**
+- `mcp__context7__resolve-library-id` - Find library ID
+- `mcp__context7__get-library-docs` - Get documentation for specific topic
 
 ### Workflow
+
+0. **Discover** (for data apps) - Before building:
+   - Use `data-explorer` subagent to find available Keboola tables
+   - Ask user which data to visualize (max 2-3 clarifying questions)
+   - Confirm understanding: "I'll build X showing Y data with Z features. OK?"
+   - Only proceed after user confirms
 
 1. **Create** - Use `Write` to create new files
 2. **Edit** - Use `Edit` for modifications (NOT Write for existing files)
 3. **Verify** - Run `npm run build` via Bash to check for errors
-4. **Fix** - If errors, read the files and fix them
+4. **Fix** - If errors, use `code-reviewer` then `error-fixer` subagents
 5. **Preview** - Start dev server and provide preview URL
 
 ### Code Quality
@@ -128,6 +145,7 @@ module.exports = nextConfig;
   /charts/             # Chart components
 /lib
   /utils.ts            # Utility functions
+  /keboola.ts          # Keboola API utilities
 /types
   /index.ts            # TypeScript types
 ```
@@ -145,93 +163,291 @@ Before considering the app complete:
 **NEVER run `npm run dev` via Bash!** It will use port 3000 which conflicts with the frontend.
 **ALWAYS use `mcp__e2b__sandbox_start_dev_server` tool** - it automatically allocates a free port (3001+) and returns the correct preview URL.
 
-### Error Handling
+### Subagents Available
 
-If build fails:
+Delegate to specialized subagents via Task tool:
+- `data-explorer`: Discovers Keboola tables/schemas. Use FIRST for data apps.
+- `code-reviewer`: Analyzes build errors. Use when build fails.
+- `error-fixer`: Applies surgical code fixes.
+- `component-generator`: Creates React components.
+
+---
+
+## Keboola Storage API Reference
+
+When working with Keboola data, use these patterns:
+
+### Authentication
+- Token is available as `$KBC_TOKEN` environment variable
+- Always use header: `X-StorageApi-Token: $KBC_TOKEN`
+
+### CRITICAL: Use JSON Format, Not CSV
+CSV parsing fails with complex data (HTML, nested quotes). **Always use JSON format:**
+```bash
+curl -s -H "X-StorageApi-Token: $KBC_TOKEN" \\
+  "${KBC_URL}/v2/storage/tables/{table_id}/data-preview?limit=1000&format=json"
+```
+
+### API Limits
+- **Maximum limit per request: 1000 rows** (not documented, fails silently with higher values!)
+- For larger datasets, use pagination with `offset` parameter
+- For very large datasets (>100k rows), use async export or pre-aggregate in Keboola
+
+### Response Structure (JSON format)
+```json
+{
+  "columns": ["col1", "col2"],
+  "rows": [
+    {"col1": "value1", "col2": "value2"}
+  ]
+}
+```
+
+### Common Endpoints
+```bash
+# List buckets
+curl -s -H "X-StorageApi-Token: $KBC_TOKEN" "${KBC_URL}/v2/storage/buckets"
+
+# List tables in bucket
+curl -s -H "X-StorageApi-Token: $KBC_TOKEN" "${KBC_URL}/v2/storage/buckets/{bucket_id}/tables"
+
+# Preview table data (ALWAYS use format=json!)
+curl -s -H "X-StorageApi-Token: $KBC_TOKEN" \\
+  "${KBC_URL}/v2/storage/tables/{table_id}/data-preview?limit=1000&format=json"
+```
+
+### Recommended Keboola Utility (create in /lib/keboola.ts)
+```typescript
+const KBC_URL = process.env.KBC_URL || 'https://connection.north-europe.azure.keboola.com';
+
+export async function fetchTable(tableId: string, limit = 1000) {
+  const token = process.env.KBC_TOKEN;
+  const response = await fetch(
+    `${KBC_URL}/v2/storage/tables/${tableId}/data-preview?limit=${limit}&format=json`,
+    {
+      headers: { 'X-StorageApi-Token': token || '' },
+      cache: 'no-store'
+    }
+  );
+  if (!response.ok) throw new Error(`Keboola API error: ${response.status}`);
+  const data = await response.json();
+  return data.rows || [];
+}
+
+export async function fetchTablePaginated(tableId: string, maxRows = 5000) {
+  const allRows = [];
+  let offset = 0;
+  const limit = 1000;
+
+  while (allRows.length < maxRows) {
+    const response = await fetch(
+      `${KBC_URL}/v2/storage/tables/${tableId}/data-preview?limit=${limit}&offset=${offset}&format=json`,
+      { headers: { 'X-StorageApi-Token': process.env.KBC_TOKEN || '' }, cache: 'no-store' }
+    );
+    const { rows } = await response.json();
+    if (!rows || rows.length === 0) break;
+    allRows.push(...rows);
+    offset += limit;
+  }
+  return allRows;
+}
+```
+
+### Common Gotchas
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| Empty `rows` array | limit > 1000 | Use limit=1000 max |
+| CSV parsing fails | HTML/special chars in data | Use format=json |
+| 401 Unauthorized | Bad token | Check $KBC_TOKEN |
+| Stale data | Next.js caching | Use cache: 'no-store' |
+
+---
+
+## Debugging Workflow
+
+When something doesn't work, follow this systematic approach:
+
+### 1. Test in Isolation First (before changing code)
+```bash
+# Test Keboola API directly
+curl -s -H "X-StorageApi-Token: $KBC_TOKEN" \\
+  "${KBC_URL}/v2/storage/tables/{table_id}/data-preview?limit=5&format=json"
+
+# Test if command works
+node -e "console.log(process.env.KBC_TOKEN ? 'Token set' : 'No token')"
+```
+
+### 2. If Standard Approach Fails Twice, Use Context7
+Don't keep guessing. Fetch actual documentation:
+```
+# Step 1: Find library ID
+mcp__context7__resolve-library-id with libraryName: "nextjs"
+
+# Step 2: Get specific docs
+mcp__context7__get-library-docs with libraryId: "/vercel/next.js" and topic: "environment variables app router"
+```
+
+### Context7 Query Examples by Situation
+| Situation | libraryName | topic |
+|-----------|-------------|-------|
+| Env vars not loading | nextjs | environment variables app router |
+| API route issues | nextjs | route handlers app router |
+| Fetch caching | nextjs | fetch cache revalidate |
+| Chart not rendering | recharts | ResponsiveContainer |
+| Tailwind not applying | tailwindcss | configuration content |
+
+### 3. Check Server Logs
+```bash
+cat /tmp/nextjs.log  # or wherever dev server logs
+```
+
+### 4. Don't Guess - Understand Root Cause
+If something fails:
+1. Read the FULL error message
+2. Test the minimal case in isolation
+3. Look up docs if behavior is unexpected
+4. Fix with understanding, not trial-and-error
+
+---
+
+## Error Handling Patterns
+
+### Build Errors
 1. Read the error message carefully
 2. Use Glob/Grep to find the problematic files
 3. Use Read to examine the context
 4. Use Edit to fix the issues surgically
 5. Run build again to verify
 
-### Subagents Available
+### API/Data Errors
+1. Test API call directly with curl
+2. Check response format (is it what you expect?)
+3. Verify authentication (is token set?)
+4. Check limits and pagination
 
-You can delegate tasks to specialized subagents using the Task tool:
-- `code-reviewer`: Reviews TypeScript/React code for errors. Use when build fails.
-- `error-fixer`: Fixes specific code errors identified by code-reviewer.
-- `component-generator`: Generates React components with TypeScript and Tailwind.
+### Runtime Errors
+1. Check browser console (mention this to user if needed)
+2. Check server logs
+3. Add console.log for debugging
+4. Remove debug code after fixing
 """
 
 # =============================================================================
 # SUBAGENTS - Specialized agents for different tasks
 # =============================================================================
 
+# Context conservation note - applies to all agents
+CONTEXT_CONSERVATION_NOTE = """
+## Context Window Conservation (CRITICAL)
+- Be concise in responses - no unnecessary explanations
+- Limit data samples to 5 rows max
+- Truncate long outputs (show first/last 10 lines of large files)
+- Don't repeat information already in context
+- Use targeted Grep patterns instead of reading entire files
+- Report only essential findings, not process narration
+"""
+
 AGENTS = {
+    "data-explorer": AgentDefinition(
+        description="Explores Keboola project to discover available data sources. Use BEFORE building data apps to understand what data exists.",
+        prompt=f"""You are a data discovery specialist.
+
+## FIRST: Check Credentials
+Run this check before anything else:
+```bash
+if [ -z "$KBC_TOKEN" ] || [ -z "$KBC_URL" ]; then
+  echo "ERROR: Keboola credentials not configured. Cannot explore data."
+  echo "Set KBC_TOKEN and KBC_URL environment variables."
+  exit 0
+fi
+echo "Credentials OK: $KBC_URL"
+```
+
+## Process
+1. List buckets (filter system buckets, max 10):
+   `curl -s -H "X-StorageApi-Token: $KBC_TOKEN" "$KBC_URL/v2/storage/buckets" | jq '[.[] | select(.id | (startswith("in.") or startswith("out.c-")) and (contains("sys.") | not) and (contains("out.c-_") | not)) | {{id, name}}] | .[0:10]'`
+2. For relevant buckets (max 3), list tables with row counts
+3. For key tables (max 3), get column names and sample 3-5 rows
+
+## Output Format (compact)
+```
+## Data Sources (credentials: OK)
+
+### Bucket: in.c-sales (2 tables)
+- orders: 15,234 rows | id, customer_id, amount, date
+- customers: 1,203 rows | id, name, email, segment
+
+### Sample: in.c-sales.orders (3 of 15,234 rows)
+| id | customer_id | amount | date |
+| 1 | 42 | 150.00 | 2024-01-15 |
+```
+
+## Rules
+- Check credentials FIRST - exit gracefully if missing
+- Filter: `in.*` and `out.c-*` only, exclude `sys.*` and `out.c-_*`
+- Cap: 10 buckets, 3 table samples, 5 rows per sample
+- Use `format=json` and `limit=5` for data samples
+- Use `jq` to filter JSON output - never dump raw responses
+{CONTEXT_CONSERVATION_NOTE}""",
+        tools=["Bash"],
+        model="haiku"  # Cheap for exploration
+    ),
+
     "code-reviewer": AgentDefinition(
         description="Reviews TypeScript/React code for errors. Use when build fails or you need code review.",
-        prompt="""You are an expert TypeScript/React code reviewer.
+        prompt=f"""You are an expert TypeScript/React code reviewer.
 
 ## Your Task
 Analyze error messages and source code to identify issues.
 
 ## Process
 1. Read the error message carefully
-2. Use Grep to find the problematic code
-3. Use Read to examine the full context
+2. Use Grep to find the problematic code (targeted patterns only)
+3. Use Read to examine minimal context around the issue
 4. Identify the exact issue
 
-## Output Format
-For each issue found, report in this format:
+## Output Format (compact)
 ```
-FILE: path/to/file.tsx
-LINE: 42
-ISSUE: Brief description of the problem
-CONFIDENCE: 85%
-FIX: Suggested fix (be specific about what to change)
+FILE: path/to/file.tsx:42
+ISSUE: Missing import for useState
+FIX: Add `import {{ useState }} from 'react'`
 ```
 
 ## Rules
 - Only report issues with confidence >= 80%
 - Focus on actual errors, not style preferences
 - Be specific about line numbers and fixes
-- Check for: missing imports, type errors, syntax errors, undefined variables
-""",
+- Don't read entire files - use Grep to find specific lines
+{CONTEXT_CONSERVATION_NOTE}""",
         tools=["Read", "Grep", "Glob"],
         model="haiku"  # Cost-effective for review tasks
     ),
 
     "error-fixer": AgentDefinition(
         description="Fixes specific code errors identified by code-reviewer.",
-        prompt="""You are a precise code fixer.
+        prompt=f"""You are a precise code fixer.
 
 ## Your Task
 Apply specific fixes to code based on error analysis.
 
 ## Process
-1. Read the current file content
+1. Read only the relevant section of the file (use offset/limit if large)
 2. Use Edit to make surgical changes (old_string → new_string)
-3. Verify the change makes sense in context
+3. Briefly confirm what you changed (one line)
 
 ## Rules
 - Use Edit tool, NOT Write (preserves more context)
 - Make minimal changes - fix only what's broken
 - One fix at a time
-- Preserve existing code style and formatting
-- After fixing, briefly explain what you changed
-
-## Common Fixes
-- Missing imports: Add the import at the top
-- Type errors: Add proper type annotations
-- Undefined variables: Check for typos or add declarations
-- Syntax errors: Fix brackets, semicolons, etc.
-""",
+- Don't explain the fix in detail - just state what changed
+{CONTEXT_CONSERVATION_NOTE}""",
         tools=["Read", "Edit"],
         model="sonnet"
     ),
 
     "component-generator": AgentDefinition(
         description="Generates React components with TypeScript and Tailwind. Use for creating new UI components.",
-        prompt="""You are a React component specialist.
+        prompt=f"""You are a React component specialist.
 
 ## Stack
 - React 18 with hooks
@@ -239,35 +455,26 @@ Apply specific fixes to code based on error analysis.
 - Tailwind CSS for styling
 - shadcn/ui for UI primitives
 
-## Component Structure
+## Component Template
 ```typescript
 'use client'  // Only if using hooks/state/effects
 
-import { ComponentType } from 'react'
+interface Props {{
+  // Define props with types
+}}
 
-interface Props {
-  // Define all props with proper types
-}
-
-export default function ComponentName({ prop1, prop2 }: Props) {
-  // Implementation
-  return (
-    <div className="...">
-      {/* JSX */}
-    </div>
-  )
-}
+export default function ComponentName({{ prop1 }}: Props) {{
+  return <div className="...">...</div>
+}}
 ```
 
 ## Rules
-- Use 'use client' ONLY for components with state, effects, or event handlers
-- Export as default
-- Include proper TypeScript types for all props
+- Use 'use client' ONLY for components with state/effects/events
+- Include TypeScript types for all props
 - Make responsive with Tailwind (mobile-first)
-- Use semantic HTML elements
 - Include loading and error states where appropriate
-- Use Tailwind's design system (spacing: 4, 8, 16..., colors: slate, blue...)
-""",
+- Don't add unnecessary comments or documentation
+{CONTEXT_CONSERVATION_NOTE}""",
         tools=["Write", "Read"],
         model="sonnet"
     ),
@@ -318,16 +525,21 @@ The build command failed with exit code {exit_code}.
 ```
 
 ### Required Actions:
-1. Use the `code-reviewer` subagent (via Task tool) to analyze these errors
-2. Use the `error-fixer` subagent (via Task tool) to fix each identified issue
-3. Run the build again to verify fixes
+1. **Read the error carefully** - Understand the root cause before changing code
+2. **If error involves Next.js/React/library behavior you're unsure about:**
+   - Use `mcp__context7__resolve-library-id` to find the library
+   - Use `mcp__context7__get-library-docs` to get current documentation
+3. Use the `code-reviewer` subagent (via Task tool) to analyze these errors
+4. Use the `error-fixer` subagent (via Task tool) to fix each identified issue
+5. Run the build again to verify fixes
 
-Example Task tool usage:
+### Context7 Example (for framework questions):
 ```
-Use Task tool with subagent_type="code-reviewer" to analyze the build errors above.
+mcp__context7__resolve-library-id with libraryName: "nextjs"
+mcp__context7__get-library-docs with libraryId: "/vercel/next.js" and topic: "the specific error topic"
 ```
 
-Do NOT proceed to preview until the build succeeds.
+Do NOT proceed to preview until the build succeeds. Do NOT guess - look up docs if unsure.
 """
         }
 
@@ -355,10 +567,61 @@ async def log_tool_usage(
     return {}
 
 
+# Track discovery state per session for soft-warning hook
+_discovery_state: dict[str, dict] = {}  # session_id -> {"explored": bool, "warned": bool}
+
+
+async def remind_discovery_before_build(
+    input_data: dict,
+    tool_use_id: str | None,
+    context: dict
+) -> dict:
+    """
+    PreToolUse hook - reminds agent to run discovery if skipped.
+    Soft warning: injects system message but allows proceeding.
+    """
+    tool_name = input_data.get("tool_name", "unknown")
+    session_id = context.get("session_id", "default")
+
+    # Initialize state for session
+    if session_id not in _discovery_state:
+        _discovery_state[session_id] = {"explored": False, "warned": False}
+
+    state = _discovery_state[session_id]
+
+    # Mark discovery complete when data-explorer Task is invoked
+    if tool_name == "Task":
+        task_input = input_data.get("tool_input", {})
+        if "data-explorer" in str(task_input):
+            state["explored"] = True
+            logger.info(f"[HOOK] Discovery marked complete for session {session_id}")
+            return {}
+
+    # Warn once if Write/Edit used without discovery (soft warning - allows proceeding)
+    gated_tools = ["Write", "Edit", "mcp__sandbox__sandbox_write_file"]
+    if tool_name in gated_tools and not state["explored"] and not state["warned"]:
+        state["warned"] = True
+        logger.info(f"[HOOK] Soft warning: Write/Edit without discovery for session {session_id}")
+        return {
+            "systemMessage": """## Reminder: Discovery Phase
+
+You're about to write code without exploring available data first.
+
+Consider using the `data-explorer` subagent to:
+- Discover available Keboola tables
+- Understand data schemas
+- Confirm requirements with user
+
+If you've already discussed requirements with the user, proceed with building."""
+        }
+
+    return {}
+
+
 # Hook configuration
 HOOKS = {
     "PreToolUse": [
-        HookMatcher(hooks=[log_tool_usage]),
+        HookMatcher(hooks=[log_tool_usage, remind_discovery_before_build]),
     ],
     "PostToolUse": [
         HookMatcher(matcher="Bash", hooks=[validate_build_result]),
@@ -450,69 +713,66 @@ async def permission_callback(
     return {"behavior": "allow"}
 
 
-# Legacy system prompt for E2B mode (kept for backwards compatibility)
-LEGACY_SYSTEM_PROMPT = """You are an expert Next.js/React/TypeScript developer building data-driven web applications in an isolated sandbox environment.
+# =============================================================================
+# KEBOOLA CONTEXT - Dynamically loaded from environment
+# =============================================================================
 
-CRITICAL: You are working in a sandbox environment. ALL commands and file operations run INSIDE this sandbox. NEVER tell the user to run commands themselves - YOU must run everything in the sandbox using your tools.
+def get_keboola_context() -> str:
+    """Get Keboola context for system prompt if credentials are configured."""
+    kbc_token = os.getenv("KBC_TOKEN", "")
+    kbc_url = os.getenv("KBC_URL", "")
+    workspace_id = os.getenv("WORKSPACE_ID", "")
+    branch_id = os.getenv("BRANCH_ID", "")
 
-Your role is to help users build modern, production-quality web applications using:
-- **Next.js 14+** with App Router
-- **React 18+** with TypeScript
-- **Tailwind CSS** for styling
-- **shadcn/ui** for UI components
-- **Data visualization** libraries (recharts, plotly, etc.)
+    if not kbc_token or kbc_token == "xxx":
+        return ""
 
-## Your Capabilities
+    return f"""
+## Keboola Storage API Access
 
-You have access to sandbox tools that allow you to:
-1. **Create files** - Write code files (components, pages, utilities, configs)
-2. **Execute commands** - Run npm/yarn commands, build, test, install packages
-3. **Read files** - Inspect existing code and configurations
-4. **List files** - Explore project structure
-5. **Install packages** - Add npm dependencies
-6. **Run dev server** - Start Next.js development server with hot reload
-7. **Get preview URL** - Access the live running application
+You have access to Keboola Storage API for reading data from the user's Keboola project.
 
-## CRITICAL: Running Applications
+**Credentials (available as environment variables in sandbox):**
+- `KBC_TOKEN`: Storage API token (set)
+- `KBC_URL`: `{kbc_url}`
+- `WORKSPACE_ID`: `{workspace_id}`
+- `BRANCH_ID`: `{branch_id}`
 
-When you finish building an application, you MUST follow this EXACT sequence:
-1. Run `npm install` using sandbox_run_command to install dependencies
-2. Use `sandbox_start_dev_server` tool to start the Next.js dev server - this runs in background and returns the preview URL
-3. The preview URL from sandbox_start_dev_server is the FINAL URL - share it with the user
+### CRITICAL: Use JSON Format, Not CSV
+CSV parsing fails with complex data (HTML, nested quotes). **Always use `format=json`:**
 
-**CRITICAL RULES - VIOLATION WILL CAUSE ERRORS:**
+### CRITICAL: Maximum 1000 Rows Per Request
+The API silently returns empty data if limit > 1000. Always use `limit=1000` max.
 
-1. **NEVER run `npm run dev` via sandbox_run_command** - This will timeout and fail!
-   - GOOD: `sandbox_start_dev_server()` ✓
+**How to use Keboola data:**
 
-2. **Port is AUTO-ALLOCATED (never 3000)** - Port 3000 is reserved for our frontend!
-
-3. **Only call sandbox_start_dev_server ONCE**
-
-NEVER tell the user to run commands themselves. YOU run everything in the sandbox.
-
-## CRITICAL: next.config.js for Preview
-
-ALWAYS create this next.config.js:
-
-```javascript
-/** @type {import('next').NextConfig} */
-const nextConfig = {
-  async headers() {
-    return [
-      {
-        source: '/:path*',
-        headers: [
-          { key: 'X-Frame-Options', value: 'ALLOWALL' },
-          { key: 'Content-Security-Policy', value: "frame-ancestors 'self' http://localhost:* http://127.0.0.1:*" },
-        ],
-      },
-    ];
-  },
-};
-
-module.exports = nextConfig;
+1. **List buckets:**
+```bash
+curl -s -H "X-StorageApi-Token: $KBC_TOKEN" "{kbc_url}v2/storage/buckets" | jq '.[] | {{id, name, description}}'
 ```
+
+2. **List tables in a bucket:**
+```bash
+curl -s -H "X-StorageApi-Token: $KBC_TOKEN" "{kbc_url}v2/storage/buckets/BUCKET_ID/tables" | jq '.[] | {{id, name, rowsCount}}'
+```
+
+3. **Preview table data (ALWAYS use format=json and limit<=1000):**
+```bash
+curl -s -H "X-StorageApi-Token: $KBC_TOKEN" \\
+  "{kbc_url}v2/storage/tables/TABLE_ID/data-preview?limit=1000&format=json"
+```
+
+4. **For larger datasets, paginate:**
+```bash
+# Page 1
+curl -s -H "X-StorageApi-Token: $KBC_TOKEN" \\
+  "{kbc_url}v2/storage/tables/TABLE_ID/data-preview?limit=1000&offset=0&format=json"
+# Page 2
+curl -s -H "X-StorageApi-Token: $KBC_TOKEN" \\
+  "{kbc_url}v2/storage/tables/TABLE_ID/data-preview?limit=1000&offset=1000&format=json"
+```
+
+**IMPORTANT:** When user asks about "data in the project" or "Keboola data", use these API calls to explore what tables are available and build apps that visualize that data.
 """
 
 
@@ -620,7 +880,7 @@ class AppBuilderAgent:
 
             model=model,
 
-            # Native tools + E2B MCP tools + Task for subagents
+            # Native tools + E2B MCP tools + Context7 MCP tools + Task for subagents
             allowed_tools=[
                 # Native Claude Code tools
                 "Read", "Write", "Edit",
@@ -630,11 +890,18 @@ class AppBuilderAgent:
                 # E2B-specific MCP tools (note: includes 'sandbox_' prefix from tool function names)
                 "mcp__e2b__sandbox_get_preview_url",
                 "mcp__e2b__sandbox_start_dev_server",
+                # Context7 MCP tools for live documentation
+                "mcp__context7__resolve-library-id",
+                "mcp__context7__get-library-docs",
             ],
 
-            # E2B MCP server for preview URL and dev server
+            # MCP servers: E2B for sandbox ops, Context7 for live docs
             mcp_servers={
-                "e2b": self.mcp_server
+                "e2b": self.mcp_server,
+                "context7": {
+                    "command": "npx",
+                    "args": ["-y", "@upstash/context7-mcp@latest"],
+                },
             },
 
             # Specialized subagents for code review, error fixing, and component generation
@@ -655,7 +922,7 @@ class AppBuilderAgent:
         await self.client.connect()
 
     async def _initialize_e2b_mode(self, model: str) -> None:
-        """Initialize agent for E2B cloud mode with MCP tools (legacy approach)."""
+        """Initialize agent for E2B cloud mode with MCP tools."""
 
         # Initialize sandbox manager with session context
         self.sandbox_manager = create_sandbox_manager(session_id=self.session_id)
@@ -663,12 +930,20 @@ class AppBuilderAgent:
         # Create full MCP tools server for E2B operations
         self.mcp_server = create_sandbox_tools_server(self.sandbox_manager, session_id=self.session_id)
 
-        # Configure Claude Agent SDK with MCP tools (legacy approach)
+        # Use unified system prompt (same as local mode) with Keboola context
+        system_prompt = SYSTEM_PROMPT_APPEND + get_keboola_context()
+
+        # Configure Claude Agent SDK with MCP tools + Context7 + subagents + hooks
         options = ClaudeAgentOptions(
-            system_prompt=LEGACY_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             model=model,
             mcp_servers={
-                "sandbox": self.mcp_server
+                "sandbox": self.mcp_server,
+                # Context7 for live documentation lookup (same as local mode)
+                "context7": {
+                    "command": "npx",
+                    "args": ["-y", "@upstash/context7-mcp@latest"],
+                },
             },
             allowed_tools=[
                 "mcp__sandbox__sandbox_write_file",
@@ -678,7 +953,15 @@ class AppBuilderAgent:
                 "mcp__sandbox__sandbox_install_packages",
                 "mcp__sandbox__sandbox_get_preview_url",
                 "mcp__sandbox__sandbox_start_dev_server",
+                # Context7 MCP tools for live documentation
+                "mcp__context7__resolve-library-id",
+                "mcp__context7__get-library-docs",
+                # Task tool for subagents
+                "Task",
             ],
+            # Add subagents and hooks (same as local mode)
+            agents=AGENTS,
+            hooks=HOOKS,
             permission_mode="acceptEdits",
         )
 
@@ -804,10 +1087,20 @@ class AppBuilderAgent:
 
         # If we didn't get preview URL from tool results, try sandbox manager
         if not preview_url and self.sandbox_manager:
-            manager_preview_url = self.sandbox_manager.preview_url
-            if manager_preview_url:
-                preview_url = manager_preview_url
-                self.slogger.log_agent("PREVIEW_URL_FOUND", f"source=sandbox_manager, url={preview_url}")
+            try:
+                # LocalSandboxManager has preview_url property, E2B SandboxManager has get_preview_url method
+                if hasattr(self.sandbox_manager, 'preview_url'):
+                    manager_preview_url = self.sandbox_manager.preview_url
+                elif hasattr(self.sandbox_manager, 'get_preview_url') and self.sandbox_manager.is_initialized:
+                    manager_preview_url = await self.sandbox_manager.get_preview_url()
+                else:
+                    manager_preview_url = None
+
+                if manager_preview_url:
+                    preview_url = manager_preview_url
+                    self.slogger.log_agent("PREVIEW_URL_FOUND", f"source=sandbox_manager, url={preview_url}")
+            except Exception as e:
+                logger.warning(f"[{self.session_id}] Could not get preview URL from sandbox manager: {e}")
 
         # Send done event with preview URL if available
         done_event = {

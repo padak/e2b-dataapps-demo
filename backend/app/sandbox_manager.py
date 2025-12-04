@@ -7,9 +7,24 @@ and cleanup of E2B sandboxes with lazy initialization and comprehensive error ha
 
 import asyncio
 import logging
+import os
 from typing import Optional, Dict, Any, List
 
 from e2b_code_interpreter import Sandbox
+
+
+def get_keboola_envs() -> Dict[str, str]:
+    """Get Keboola environment variables to pass to sandbox."""
+    envs = {}
+
+    kbc_token = os.getenv("KBC_TOKEN", "")
+    if kbc_token and kbc_token != "xxx":
+        envs["KBC_TOKEN"] = kbc_token
+        envs["KBC_URL"] = os.getenv("KBC_URL", "https://connection.keboola.com/")
+        envs["WORKSPACE_ID"] = os.getenv("WORKSPACE_ID", "")
+        envs["BRANCH_ID"] = os.getenv("BRANCH_ID", "")
+
+    return envs
 
 
 # Configure logging
@@ -75,8 +90,12 @@ class SandboxManager:
 
     def _create_sandbox_sync(self, template: str) -> Sandbox:
         """Synchronous sandbox creation."""
-        logger.info(f"[{self._session_id}] Calling Sandbox.create(template='{template}', timeout={self._timeout})")
-        sandbox = Sandbox.create(template=template, timeout=self._timeout)
+        # Get Keboola env vars to pass to sandbox
+        envs = get_keboola_envs()
+        env_keys = list(envs.keys()) if envs else []
+
+        logger.info(f"[{self._session_id}] Calling Sandbox.create(template='{template}', timeout={self._timeout}, envs={env_keys})")
+        sandbox = Sandbox.create(template=template, timeout=self._timeout, envs=envs if envs else None)
         logger.info(f"[{self._session_id}] Sandbox created: {sandbox.sandbox_id}")
         return sandbox
 
