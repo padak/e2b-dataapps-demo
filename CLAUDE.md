@@ -1,73 +1,106 @@
-# E2B Data Apps Builder
+# CLAUDE.md
 
-AI-powered application builder using Claude Agent SDK. Users describe apps in natural language, Claude builds them with live preview.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Structure
+## Project Overview
 
-```
-backend/app/          # FastAPI + Claude Agent SDK
-frontend/src/         # React + Zustand + WebSocket
-docs/                 # Architecture documentation
-tests/                # Test files
-```
+AI-powered app builder using Claude Agent SDK. Users describe apps in natural language, Claude builds them with live preview via WebSocket streaming.
 
-## Key Files
-
-- `backend/app/agent.py` - Main agent with subagents and hooks
-- `backend/app/websocket.py` - WebSocket connection manager
-- `backend/app/local_sandbox_manager.py` - Local sandbox (primary mode)
-- `frontend/src/AppBuilder.tsx` - Main UI component
-- `frontend/src/lib/store.ts` - Zustand state
-- `frontend/src/lib/websocket.ts` - WebSocket client
-
-## Running Locally
+## Commands
 
 ```bash
-# Backend
+# Backend (use python3.13 venv)
 cd backend && source .venv/bin/activate
 SANDBOX_MODE=local uvicorn app.main:app --reload --port 8000
 
 # Frontend
 cd frontend && npm run dev
+
+# Tests
+cd backend && pytest tests/ -v
+pytest tests/test_permission_callback.py -v  # single test file
+pytest tests/test_api.py::test_health -v     # single test
 ```
 
-## Architecture Principles
+## Architecture
 
-### Agent Design
-- **Native tools over MCP** - Use Read, Write, Edit, Bash, Glob, Grep directly
-- **Subagents for specialization** - code-reviewer (Haiku), error-fixer (Sonnet)
-- **Self-correction via hooks** - PostToolUse hook triggers fixes on build failure
-- **Permission callbacks** - Block dangerous commands and sensitive files
+**Backend (FastAPI + Claude Agent SDK):**
+- `agent.py` - AppBuilderAgent with subagents (code-reviewer, error-fixer), hooks (PostToolUse for self-correction), and permission callbacks
+- `websocket.py` - ConnectionManager for WebSocket lifecycle
+- `local_sandbox_manager.py` - Local sandbox at `/tmp/app-builder/{session_id}`
+- `sandbox_manager.py` - E2B cloud sandbox (alternative mode)
 
-### Sandbox Modes
-- `SANDBOX_MODE=local` - Local filesystem at `/tmp/app-builder/{session_id}`
-- `SANDBOX_MODE=e2b` - E2B cloud sandbox (requires API key)
+**Frontend (React + Zustand):**
+- `AppBuilder.tsx` - Main UI with chat and preview panels
+- `lib/store.ts` - Zustand state management
+- `lib/websocket.ts` - WebSocket client with reconnection
 
-### WebSocket Protocol
-Client sends: `{"type": "chat|ping|reset", "message": "..."}`
-Server streams: `text`, `tool_use`, `tool_result`, `done`
+## Agent Design Patterns
 
-## Testing
+- **Native tools over MCP** - Read, Write, Edit, Bash, Glob, Grep directly (in local mode)
+- **Subagents** - code-reviewer (Haiku, cheap), error-fixer (Sonnet)
+- **Self-correction** - PostToolUse hook on Bash detects build failures, injects system message to trigger fix loop
+- **Permission callbacks** - Block `rm -rf /`, `sudo`, `.env` access, etc.
 
+## WebSocket Protocol
+
+```
+Client → Server: {"type": "chat|ping|reset", "message": "..."}
+Server → Client: text, tool_use, tool_result, done (with preview_url)
+```
+
+## Modifying Agent Behavior
+
+**Add subagent** - Edit `agent.py`, add to `AGENTS` dict with description, prompt, tools, model
+
+**Add hook** - Edit `agent.py`, add to `HOOKS` dict (PreToolUse or PostToolUse)
+
+## Keboola Integration
+
+### Critical Rules
+- **Always use JSON format** - CSV parsing fails with HTML/special chars
+- **Max 1000 rows per request** - Undocumented limit, fails silently
+- Use `format=json` and `cache: 'no-store'` in fetch
+
+### API Endpoints
 ```bash
-cd backend
-pytest tests/ -v
+# List buckets
+curl -H "X-StorageApi-Token: $KBC_TOKEN" "$KBC_URL/v2/storage/buckets"
+
+# Preview table (ALWAYS use format=json)
+curl -H "X-StorageApi-Token: $KBC_TOKEN" \
+  "$KBC_URL/v2/storage/tables/{table_id}/data-preview?limit=1000&format=json"
 ```
 
-## Common Tasks
+### Common Gotchas
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| Empty rows | limit > 1000 | Use max 1000 |
+| CSV parse fails | HTML in data | Use format=json |
+| Stale data | Next.js cache | Use cache: 'no-store' |
 
-### Adding a new subagent
-Edit `backend/app/agent.py` - add to `AGENTS` dict with:
-- `description` - When to use
-- `prompt` - Instructions
-- `tools` - Allowed tools
-- `model` - haiku/sonnet
+## Context7 Usage
 
-### Adding a new hook
-Edit `backend/app/agent.py` - add to `HOOKS` dict:
-- `PreToolUse` - Before tool execution
-- `PostToolUse` - After tool execution (for validation)
+When standard approach fails twice, fetch live docs:
 
-### Modifying sandbox behavior
-- Local: `backend/app/local_sandbox_manager.py`
-- E2B: `backend/app/sandbox_manager.py`
+```
+# Step 1: Find library ID
+mcp__context7__resolve-library-id with libraryName: "nextjs"
+
+# Step 2: Get specific docs
+mcp__context7__get-library-docs with libraryId: "/vercel/next.js", topic: "environment variables"
+```
+
+### Query Examples
+| Situation | libraryName | topic |
+|-----------|-------------|-------|
+| Env vars not loading | nextjs | environment variables app router |
+| API route issues | nextjs | route handlers app router |
+| Chart not rendering | recharts | ResponsiveContainer |
+
+## Debugging Workflow
+
+1. **Test in isolation** - curl the API directly before changing code
+2. **Read full error** - Don't guess, understand root cause
+3. **Use Context7** - If standard approach fails twice, fetch docs
+4. **Check logs** - `cat /tmp/nextjs.log` for server errors
